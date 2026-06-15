@@ -1,0 +1,17 @@
+{
+  "repository": "apache/paimon",
+  "source_remote": "github",
+  "source_branch": "master",
+  "source_ref": "github/master",
+  "baseline_branch": "feature/paimon-1.5-tob-base-phase1-spec",
+  "baseline_commit": "cc9bb8e165be69c05e615e008d1b9e1a4d26b187",
+  "baseline_commit_date": "2026-06-05 17:39:20 +0800",
+  "release_impact_ref": "github/release-1.4",
+  "release_impact_commit": "53815aebfd8d2d661be0c0bc5d7b54c6249bdec5",
+  "last_processed_commit": "575ce805ed069ab380d762ee6d9556f8393c6e16",
+  "last_processed_commit_date": "2026-06-15 12:57:23 +0800",
+  "last_report_date": "2026-06-15",
+  "last_report_path": "reports/paimon-master-daily/2026-06-15.md",
+  "timezone": "Asia/Shanghai",
+  "notes": "Only advance last_processed_commit after the corresponding daily report has inspected every commit in the range."
+}
