@@ -13,8 +13,8 @@
   "release_impact_commit": "05d1ba75a97cc889b0c7988167464b691bd59173",
   "last_processed_commit": "7234e4c34e9a705af66a816f5c859afd55b8f7f4",
   "last_processed_commit_date": "2026-07-18 13:35:37 +0800",
-  "last_report_date": "2026-07-18",
-  "last_report_path": "reports/paimon-master-daily/2026-07-18.md",
+  "last_report_date": "2026-07-19",
+  "last_report_path": "reports/paimon-master-daily/2026-07-19.md",
   "timezone": "Asia/Shanghai",
   "notes": "Only advance last_processed_commit after the corresponding daily report has inspected every commit in the range."
 }
