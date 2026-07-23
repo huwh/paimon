@@ -11,10 +11,10 @@
   "baseline_commit_date": "2026-06-05 17:39:20 +0800",
   "release_impact_ref": "upstream/release-1.4",
   "release_impact_commit": "05d1ba75a97cc889b0c7988167464b691bd59173",
-  "last_processed_commit": "b52f55f7801e16cdfd64b2fc935b3d3f14257af8",
-  "last_processed_commit_date": "2026-07-22 11:38:02 +0800",
-  "last_report_date": "2026-07-22",
-  "last_report_path": "reports/paimon-master-daily/2026-07-22.md",
+  "last_processed_commit": "85a01158ca9681cbc3988d72546ec0b9eee37fab",
+  "last_processed_commit_date": "2026-07-22 21:25:32 +0800",
+  "last_report_date": "2026-07-23",
+  "last_report_path": "reports/paimon-master-daily/2026-07-23.md",
   "timezone": "Asia/Shanghai",
   "notes": "Only advance last_processed_commit after the corresponding daily report has inspected every commit in the range."
 }
