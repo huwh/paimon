@@ -450,7 +450,7 @@ public class NativeVectorGlobalIndexWriter implements GlobalIndexSingleColumnWri
         }
     }
 
-    private static int checkedRecordSize(int dim, int bufferCapacity) {
+    static int checkedRecordSize(int dim, int bufferCapacity) {
         long recordSize = Long.BYTES + (long) dim * Float.BYTES;
         if (recordSize > bufferCapacity || recordSize > Integer.MAX_VALUE) {
             throw new IllegalStateException(

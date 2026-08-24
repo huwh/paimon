@@ -20,6 +20,7 @@ package org.apache.paimon.manifest;
 
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.globalindex.IndexFileKind;
 import org.apache.paimon.index.GlobalIndexMeta;
 import org.apache.paimon.index.IndexFileMeta;
 import org.apache.paimon.utils.ObjectSerializer;
@@ -29,6 +30,8 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.util.Random;
+
+import java.nio.charset.StandardCharsets;
 
 import static org.apache.paimon.index.IndexFileMetaSerializerTest.randomIndexFile;
 import static org.apache.paimon.io.DataFileTestUtils.row;
@@ -89,6 +92,66 @@ public class IndexManifestEntrySerializerTest extends ObjectSerializerTestBase<I
 
         assertThat(restored.indexMeta()).containsExactly(3, 4);
         assertThat(restored.sourceMeta()).containsExactly(1, 2);
+    }
+
+    @Test
+    void testIndexFileKindRoundTrip() throws IOException {
+        IndexManifestEntrySerializer serializer = new IndexManifestEntrySerializer();
+        IndexManifestEntry entry =
+                new IndexManifestEntry(
+                        FileKind.ADD,
+                        BinaryRow.EMPTY_ROW,
+                        0,
+                        new IndexFileMeta(
+                                "ivf-pq",
+                                "routing-model",
+                                100,
+                                0,
+                                null,
+                                null,
+                                new GlobalIndexMeta(
+                                        0,
+                                        9,
+                                        7,
+                                        null,
+                                        "{\"shardMode\":\"centroid-based\"}"
+                                                .getBytes(StandardCharsets.UTF_8)),
+                                IndexFileKind.ROUTING_MODEL));
+
+        IndexFileMeta restored =
+                serializer.deserializeFromBytes(serializer.serializeToBytes(entry)).indexFile();
+
+        assertThat(restored.fileKind()).isEqualTo(IndexFileKind.ROUTING_MODEL);
+        assertThat(new String(restored.globalIndexMeta().indexMeta(), StandardCharsets.UTF_8))
+                .isEqualTo("{\"shardMode\":\"centroid-based\"}");
+    }
+
+    @Test
+    void testVersion5RoutingModelFileKindMigration() throws IOException {
+        IndexManifestEntrySerializer serializer = new IndexManifestEntrySerializer();
+        IndexManifestEntry entry =
+                new IndexManifestEntry(
+                        FileKind.ADD,
+                        BinaryRow.EMPTY_ROW,
+                        0,
+                        new IndexFileMeta(
+                                "ivf-pq",
+                                "routing-model",
+                                100,
+                                0,
+                                new GlobalIndexMeta(
+                                        0,
+                                        9,
+                                        7,
+                                        null,
+                                        "{\"fileKind\":\"ROUTING_MODEL\",\"shardMode\":\"centroid-based\"}"
+                                                .getBytes(StandardCharsets.UTF_8)),
+                                null));
+        IndexFileMeta restored = serializer.fromRow(serializer.toRow(entry)).indexFile();
+
+        assertThat(restored.fileKind()).isEqualTo(IndexFileKind.ROUTING_MODEL);
+        assertThat(new String(restored.globalIndexMeta().indexMeta(), StandardCharsets.UTF_8))
+                .isEqualTo("{\"shardMode\":\"centroid-based\"}");
     }
 
     @Override

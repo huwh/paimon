@@ -967,6 +967,36 @@ class GlobalIndexEvaluatorTest {
     }
 
     @Test
+    void testOffsetReaderSkipsVectorOffsetForAbsoluteRowIdReader() {
+        RoaringNavigableMap64 bitmap = new RoaringNavigableMap64();
+        bitmap.add(100L);
+        ScoredGlobalIndexResult absoluteResult =
+                ScoredGlobalIndexResult.create(bitmap, rowId -> rowId == 100L ? 1.0f : 0.0f);
+        GlobalIndexReader delegate =
+                new StubGlobalIndexReader(null) {
+                    @Override
+                    public boolean returnsAbsoluteRowIds() {
+                        return true;
+                    }
+
+                    @Override
+                    public CompletableFuture<Optional<ScoredGlobalIndexResult>> visitVectorSearch(
+                            VectorSearch vectorSearch) {
+                        return CompletableFuture.completedFuture(Optional.of(absoluteResult));
+                    }
+                };
+
+        Optional<ScoredGlobalIndexResult> result =
+                new OffsetGlobalIndexReader(delegate, 10L, 20L)
+                        .visitVectorSearch(new VectorSearch(new float[] {1.0f}, 1, "v"))
+                        .join();
+
+        assertThat(result).isPresent();
+        assertBitmapContainsExactly(result.get().results(), 100L);
+        assertThat(result.get().scoreGetter().score(100L)).isEqualTo(1.0f);
+    }
+
+    @Test
     void testConstantReaderReturnsFixedResultForIsNaNAndNotBetween() {
         GlobalIndexResult expected = resultOf(1, 2);
         GlobalIndexReader reader = new ConstantGlobalIndexReader(expected);

@@ -32,6 +32,7 @@ import org.apache.paimon.manifest.ManifestEntry;
 import org.apache.paimon.operation.FileStoreScan;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.partition.PartitionPredicate;
+import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.table.source.Split;
@@ -99,6 +100,19 @@ public class GlobalIndexBuilderUtils {
             Range range,
             List<DataField> fields,
             String indexType,
+            List<ResultEntry> entries)
+            throws IOException {
+        return toIndexFileMetas(
+                fileIO, indexPathFactory, options, range, fields, indexType, entries, null);
+    }
+
+    public static List<IndexFileMeta> toIndexFileMetas(
+            FileIO fileIO,
+            IndexPathFactory indexPathFactory,
+            CoreOptions options,
+            Range range,
+            List<DataField> fields,
+            String indexType,
             List<ResultEntry> entries,
             @Nullable byte[] sourceMeta)
             throws IOException {
@@ -132,6 +146,16 @@ public class GlobalIndexBuilderUtils {
         return Range.sortAndMergeOverlap(dataRange.exclude(indexedRanges), true);
     }
 
+    public static List<Range> unindexedRowRanges(
+            FileStoreTable table,
+            @Nullable Snapshot snapshot,
+            String indexType,
+            List<DataField> fields,
+            @Nullable PartitionPredicate partitionPredicate) {
+        return unindexedRowRanges(
+                snapshot, currentIndexEntries(table, snapshot, indexType, fields, partitionPredicate));
+    }
+
     public static List<IndexManifestEntry> currentIndexEntries(
             FileStoreTable table,
             Snapshot snapshot,
@@ -163,6 +187,70 @@ public class GlobalIndexBuilderUtils {
             entries.add(entry);
         }
         return entries;
+    }
+
+    /**
+     * Find the minimum firstRowId among files whose schema does not contain all index columns.
+     * Files at or beyond this rowId cannot be indexed because the column was added later via ALTER
+     * TABLE.
+     *
+     * @return the boundary rowId, or {@link Long#MAX_VALUE} if all files contain the columns
+     */
+    public static long findMinNonIndexableRowId(
+            SchemaManager schemaManager, List<ManifestEntry> entries, List<String> indexColumns) {
+        Map<Long, Boolean> schemaContainsColumns = new HashMap<>();
+        long minRowId = Long.MAX_VALUE;
+        long minSchemaId = -1;
+        for (ManifestEntry entry : entries) {
+            long sid = entry.file().schemaId();
+            boolean contains =
+                    schemaContainsColumns.computeIfAbsent(
+                            sid,
+                            id -> schemaManager.schema(id).fieldNames().containsAll(indexColumns));
+            if (!contains && entry.file().firstRowId() != null) {
+                long rowId = entry.file().nonNullFirstRowId();
+                if (rowId < minRowId) {
+                    minRowId = rowId;
+                    minSchemaId = sid;
+                }
+            }
+        }
+        if (minRowId != Long.MAX_VALUE) {
+            List<String> schemaFields = schemaManager.schema(minSchemaId).fieldNames();
+            List<String> missingColumns = new ArrayList<>();
+            for (String column : indexColumns) {
+                if (!schemaFields.contains(column)) {
+                    missingColumns.add(column);
+                }
+            }
+            LOG.info(
+                    "Found non-indexable files: schemaId={} missing columns {}, boundaryRowId={}",
+                    minSchemaId,
+                    missingColumns,
+                    minRowId);
+        }
+        return minRowId;
+    }
+
+    /** Keep only entries whose firstRowId is strictly less than the given boundary. */
+    public static List<ManifestEntry> filterEntriesBefore(
+            List<ManifestEntry> entries, long boundaryRowId) {
+        if (boundaryRowId == Long.MAX_VALUE) {
+            return entries;
+        }
+        List<ManifestEntry> result = new ArrayList<>();
+        for (ManifestEntry entry : entries) {
+            if (entry.file().firstRowId() != null
+                    && entry.file().nonNullFirstRowId() < boundaryRowId) {
+                result.add(entry);
+            }
+        }
+        LOG.info(
+                "Filtered {} files to {} indexable files (boundaryRowId={}).",
+                entries.size(),
+                result.size(),
+                boundaryRowId);
+        return result;
     }
 
     public static List<Pair<Range, Split>> splitByRowRangeIndex(
@@ -575,10 +663,11 @@ public class GlobalIndexBuilderUtils {
         for (ResultEntry entry : entries) {
             String fileName = entry.fileName();
             long fileSize = fileIO.getFileSize(indexPathFactory.toPath(fileName));
+            Range entryRange = entry.rowRange() == null ? range : entry.rowRange();
             GlobalIndexMeta globalIndexMeta =
                     new GlobalIndexMeta(
-                            range.from,
-                            range.to,
+                            entryRange.from,
+                            entryRange.to,
                             indexFieldId,
                             extraFieldIds,
                             entry.meta(),
@@ -596,8 +685,10 @@ public class GlobalIndexBuilderUtils {
                             fileName,
                             fileSize,
                             entry.rowCount(),
+                            null,
+                            externalPathString,
                             globalIndexMeta,
-                            externalPathString);
+                            entry.fileKind());
             results.add(indexFileMeta);
         }
         return results;

@@ -22,6 +22,7 @@ import org.apache.paimon.data.GenericArray;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalArray;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.globalindex.IndexFileKind;
 import org.apache.paimon.utils.ObjectSerializer;
 
 import java.util.Collection;
@@ -58,14 +59,17 @@ public class IndexFileMetaSerializer extends ObjectSerializer<IndexFileMeta> {
                 record.rowCount(),
                 dvMetasToRowArrayData(record.dvRanges()),
                 fromString(record.externalPath()),
-                globalIndexRow);
+                globalIndexRow,
+                record.fileKind() == IndexFileKind.DATA
+                        ? null
+                        : fromString(record.fileKind().name()));
     }
 
     @Override
     public IndexFileMeta fromRow(InternalRow row) {
         GlobalIndexMeta globalIndexMeta = null;
         if (!row.isNullAt(6)) {
-            InternalRow globalIndexRow = row.getRow(6, 6);
+            InternalRow globalIndexRow = row.getRow(6, GlobalIndexMeta.SCHEMA.getFieldCount());
             Long rowRangeStart = globalIndexRow.getLong(0);
             Long rowRangeEnd = globalIndexRow.getLong(1);
             Integer indexFieldId = globalIndexRow.getInt(2);
@@ -89,7 +93,10 @@ public class IndexFileMetaSerializer extends ObjectSerializer<IndexFileMeta> {
                 row.getLong(3),
                 row.isNullAt(4) ? null : rowArrayDataToDvMetas(row.getArray(4)),
                 row.isNullAt(5) ? null : row.getString(5).toString(),
-                globalIndexMeta);
+                globalIndexMeta,
+                row.isNullAt(7)
+                        ? IndexFileKind.DATA
+                        : IndexFileKind.valueOf(row.getString(7).toString()));
     }
 
     public static InternalArray dvMetasToRowArrayData(

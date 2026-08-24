@@ -138,9 +138,9 @@ public class IndexFileHandler {
         }
 
         List<IndexManifestEntry> result = new ArrayList<>();
-        for (IndexManifestEntry file : indexManifestFile.read(indexManifest)) {
-            if (file.indexFile().indexType().equals(indexType)) {
-                result.add(file);
+        for (IndexManifestEntry entry : indexManifestFile.read(indexManifest)) {
+            if (entry.indexType().equals(indexType)) {
+                result.add(entry);
             }
         }
         return result;
@@ -198,6 +198,25 @@ public class IndexFileHandler {
         for (IndexManifestEntry file : scanEntries(snapshot, indexType, partitions)) {
             result.computeIfAbsent(Pair.of(file.partition(), file.bucket()), k -> new ArrayList<>())
                     .add(file.indexFile());
+        }
+        return result;
+    }
+
+    public Map<String, IndexFileMeta> scanByFileNames(
+            @Nullable Snapshot snapshot,
+            String indexType,
+            Set<BinaryRow> partitions,
+            Set<String> fileNames) {
+        if (fileNames.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        Map<String, IndexFileMeta> result = new HashMap<>();
+        for (IndexManifestEntry file : scanEntries(snapshot, indexType, partitions)) {
+            String fileName = file.indexFile().fileName();
+            if (fileNames.contains(fileName)) {
+                result.put(fileName, file.indexFile());
+            }
         }
         return result;
     }

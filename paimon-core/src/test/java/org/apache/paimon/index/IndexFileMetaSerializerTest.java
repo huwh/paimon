@@ -19,6 +19,7 @@
 package org.apache.paimon.index;
 
 import org.apache.paimon.deletionvectors.DeletionVectorsIndexFile;
+import org.apache.paimon.globalindex.IndexFileKind;
 import org.apache.paimon.utils.ObjectSerializer;
 import org.apache.paimon.utils.ObjectSerializerTestBase;
 
@@ -52,6 +53,25 @@ public class IndexFileMetaSerializerTest extends ObjectSerializerTestBase<IndexF
     }
 
     @Test
+    void testIndexFileKindRoundTrip() {
+        IndexFileMetaSerializer serializer = new IndexFileMetaSerializer();
+        IndexFileMeta indexFile =
+                new IndexFileMeta(
+                        "ivf-pq",
+                        "routing-model",
+                        100,
+                        0,
+                        null,
+                        null,
+                        new GlobalIndexMeta(0, 9, 7, null, new byte[] {3, 4}),
+                        IndexFileKind.ROUTING_MODEL);
+
+        IndexFileMeta restored = serializer.fromRow(serializer.toRow(indexFile));
+
+        assertThat(restored.fileKind()).isEqualTo(IndexFileKind.ROUTING_MODEL);
+    }
+
+    @Test
     void testEqualityIncludesGlobalIndexMeta() {
         IndexFileMeta first =
                 globalIndexFile(
@@ -65,8 +85,22 @@ public class IndexFileMetaSerializerTest extends ObjectSerializerTestBase<IndexF
                 globalIndexFile(
                         new GlobalIndexMeta(
                                 0, 9, 7, new int[] {8}, new byte[] {3}, new byte[] {2}));
+        IndexFileMeta differentKind =
+                new IndexFileMeta(
+                        "ivf-pq",
+                        "index-file",
+                        100,
+                        10,
+                        null,
+                        null,
+                        first.globalIndexMeta(),
+                        IndexFileKind.ROUTING_MODEL);
 
-        assertThat(first).isEqualTo(equal).hasSameHashCodeAs(equal).isNotEqualTo(different);
+        assertThat(first)
+                .isEqualTo(equal)
+                .hasSameHashCodeAs(equal)
+                .isNotEqualTo(different)
+                .isNotEqualTo(differentKind);
     }
 
     private static IndexFileMeta globalIndexFile(GlobalIndexMeta globalIndexMeta) {

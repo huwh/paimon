@@ -55,6 +55,7 @@ public class IndexManifestEntry {
     public static final String DELETION_VECTORS_RANGES = "_DELETIONS_VECTORS_RANGES";
     public static final String EXTERNAL_PATH = "_EXTERNAL_PATH";
     public static final String GLOBAL_INDEX = "_GLOBAL_INDEX";
+    public static final String INDEX_FILE_KIND = "_INDEX_FILE_KIND";
 
     public static final RowType SCHEMA =
             new RowType(
@@ -72,7 +73,8 @@ public class IndexManifestEntry {
                                     DELETION_VECTORS_RANGES,
                                     new ArrayType(true, DeletionVectorMeta.SCHEMA)),
                             new DataField(8, EXTERNAL_PATH, newStringType(true)),
-                            new DataField(9, GLOBAL_INDEX, GlobalIndexMeta.SCHEMA)));
+                            new DataField(9, GLOBAL_INDEX, GlobalIndexMeta.SCHEMA),
+                            new DataField(10, INDEX_FILE_KIND, newStringType(true))));
 
     public static final RowType MANIFEST_ROW_TYPE =
             ManifestSchemaUtils.withFormatIdentifier(SCHEMA);
@@ -80,6 +82,7 @@ public class IndexManifestEntry {
     private final FileKind kind;
     private final BinaryRow partition;
     private final int bucket;
+    private final String indexType;
     private final IndexFileMeta indexFile;
 
     public IndexManifestEntry(
@@ -87,12 +90,13 @@ public class IndexManifestEntry {
         this.kind = kind;
         this.partition = partition;
         this.bucket = bucket;
+        this.indexType = indexFile.indexType();
         this.indexFile = indexFile;
     }
 
     public IndexManifestEntry toDeleteEntry() {
         checkArgument(kind == FileKind.ADD);
-        return new IndexManifestEntry(FileKind.DELETE, partition, bucket, indexFile);
+        return new IndexManifestEntry(FileKind.DELETE, partition, bucket, indexFile());
     }
 
     public FileKind kind() {
@@ -105,6 +109,10 @@ public class IndexManifestEntry {
 
     public int bucket() {
         return bucket;
+    }
+
+    public String indexType() {
+        return indexType;
     }
 
     public IndexFileMeta indexFile() {
@@ -123,12 +131,13 @@ public class IndexManifestEntry {
         return bucket == entry.bucket
                 && kind == entry.kind
                 && Objects.equals(partition, entry.partition)
+                && Objects.equals(indexType, entry.indexType)
                 && Objects.equals(indexFile, entry.indexFile);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(kind, partition, bucket, indexFile);
+        return Objects.hash(kind, partition, bucket, indexType, indexFile);
     }
 
     @Override
@@ -140,6 +149,8 @@ public class IndexManifestEntry {
                 + partition
                 + ", bucket="
                 + bucket
+                + ", indexType="
+                + indexType
                 + ", indexFile="
                 + indexFile
                 + '}';

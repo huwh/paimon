@@ -18,9 +18,43 @@
 
 package org.apache.paimon.globalindex;
 
+import org.apache.paimon.globalindex.io.GlobalIndexFileReader;
+
+import java.util.Collections;
+import java.util.Map;
+import java.util.Set;
+
 /** A {@link GlobalIndexer} that supports vector similarity search. */
 public interface VectorGlobalIndexer extends GlobalIndexer {
 
     /** Returns the metric name used to convert vector distances to comparable scores. */
     String metric();
+
+    /**
+     * Returns whether a manifest-level index file and metadata payload represent a routing file.
+     */
+    default boolean isRoutingGlobalIndexFile(IndexFileKind fileKind, byte[] indexMeta) {
+        return fileKind == IndexFileKind.ROUTING_MODEL;
+    }
+
+    /**
+     * Routes query vectors through a persisted global routing file.
+     *
+     * <p>The default implementation means that the indexer does not support query-time split
+     * pruning. Implementations may return centroids that should be used to select physical index
+     * files from manifest metadata.
+     */
+    default Set<Integer> routeCentroids(
+            GlobalIndexFileReader fileReader,
+            GlobalIndexIOMeta globalIndexFile,
+            float[][] queryVectors,
+            int limit,
+            Map<String, String> options) {
+        return Collections.emptySet();
+    }
+
+    /** Returns whether an index file metadata payload belongs to one of the routed centroids. */
+    default boolean acceptsRoutedIndexFile(byte[] indexMeta, Set<Integer> routedCentroids) {
+        return false;
+    }
 }

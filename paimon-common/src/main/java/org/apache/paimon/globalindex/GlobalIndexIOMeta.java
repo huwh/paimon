@@ -29,11 +29,18 @@ public class GlobalIndexIOMeta {
     private final Path filePath;
     private final long fileSize;
     private final byte[] metadata;
+    private final IndexFileKind fileKind;
 
     public GlobalIndexIOMeta(Path filePath, long fileSize, byte[] metadata) {
+        this(filePath, fileSize, metadata, IndexFileKind.DATA);
+    }
+
+    public GlobalIndexIOMeta(
+            Path filePath, long fileSize, byte[] metadata, IndexFileKind fileKind) {
         this.filePath = filePath;
         this.fileSize = fileSize;
         this.metadata = metadata;
+        this.fileKind = fileKind == null ? IndexFileKind.DATA : fileKind;
     }
 
     public Path filePath() {
@@ -48,6 +55,10 @@ public class GlobalIndexIOMeta {
         return metadata;
     }
 
+    public IndexFileKind fileKind() {
+        return fileKind;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -59,12 +70,13 @@ public class GlobalIndexIOMeta {
         GlobalIndexIOMeta that = (GlobalIndexIOMeta) o;
         return Objects.equals(filePath, that.filePath)
                 && fileSize == that.fileSize
-                && Arrays.equals(metadata, that.metadata);
+                && Arrays.equals(metadata, that.metadata)
+                && fileKind == that.fileKind;
     }
 
     @Override
     public int hashCode() {
-        int result = Objects.hash(filePath, fileSize);
+        int result = Objects.hash(filePath, fileSize, fileKind);
         result = 31 * result + Arrays.hashCode(metadata);
         return result;
     }

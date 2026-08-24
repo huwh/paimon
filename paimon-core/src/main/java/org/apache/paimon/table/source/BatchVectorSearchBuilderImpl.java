@@ -133,7 +133,8 @@ public class BatchVectorSearchBuilderImpl implements BatchVectorSearchBuilder {
                     partitionFilter,
                     filter);
         }
-        return new DataEvolutionVectorScan(table, partitionFilter, filter, vectorColumn, options);
+        return new DataEvolutionVectorScan(
+                table, partitionFilter, filter, vectorColumn, options, null, vectors, limit);
     }
 
     @Override

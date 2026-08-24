@@ -44,9 +44,13 @@ import org.apache.paimon.utils.IOUtils;
 import org.apache.paimon.utils.RoaringNavigableMap64;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -70,6 +74,8 @@ public class NativeVectorGlobalIndexReader implements GlobalIndexReader {
     private static final String IVF_PQ_BATCH_TABLE_REUSE_PARAMETER = "ivf_pq.batch_table_reuse";
     private static final String IVF_PQ_BATCH_TABLE_REUSE_MAX_BYTES_PARAMETER =
             "ivf_pq.batch_table_reuse.max_bytes";
+    private static final String SEARCH_CENTROID_METHOD = "searchIvfPqCentroid";
+    private static final String SEARCH_CENTROID_BATCH_METHOD = "searchIvfPqCentroidBatch";
     private static final int VECTOR_INDEX_MIN_SEEK_FOR_VECTOR_READS = 16 * 1024;
     private static final int VECTOR_INDEX_PARALLELISM_FOR_VECTOR_READS = 32;
 
@@ -160,10 +166,7 @@ public class NativeVectorGlobalIndexReader implements GlobalIndexReader {
                 batchSearchParams(batchVectorSearch.options(), scope.effectiveK);
 
         // Flatten query vectors into one contiguous array for a single native call.
-        float[] queries = new float[n * dim];
-        for (int i = 0; i < n; i++) {
-            System.arraycopy(vectors[i], 0, queries, i * dim, dim);
-        }
+        float[] queries = flattenVectors(vectors, n, dim);
 
         VectorSearchBatchResult batchResult =
                 scope.filterBytes != null
@@ -171,6 +174,56 @@ public class NativeVectorGlobalIndexReader implements GlobalIndexReader {
                         : vectorReader.searchBatch(queries, n, searchParams);
 
         // result i corresponds to vectors[i], matching input order.
+        List<Optional<ScoredGlobalIndexResult>> results = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) {
+            results.add(
+                    buildScoredResult(
+                            batchResult.idsForQuery(i), batchResult.distancesForQuery(i), metric));
+        }
+        return results;
+    }
+
+    List<Optional<ScoredGlobalIndexResult>> searchCentroidShardBatch(
+            BatchVectorSearch batchVectorSearch,
+            int centroid,
+            NativeCentroidRoutedIndexReader.CentroidShardSearchMode searchMode)
+            throws IOException {
+        ensureLoaded();
+        if (searchMode == NativeCentroidRoutedIndexReader.CentroidShardSearchMode.ALL_LISTS) {
+            return searchBatch(withFullIvfProbe(batchVectorSearch));
+        }
+
+        int n = batchVectorSearch.vectorCount();
+        // Single vector: reuse the scalar centroid path; no batching benefit.
+        if (n == 1) {
+            List<Optional<ScoredGlobalIndexResult>> results = new ArrayList<>(1);
+            results.add(
+                    searchCentroidShard(
+                            batchVectorSearch.forIndex(0), centroid, searchMode));
+            return results;
+        }
+
+        float[][] vectors = batchVectorSearch.vectors();
+        for (float[] vector : vectors) {
+            validateSearchVector(vector);
+        }
+        int dim = nativeMeta.dimension();
+        String metric = nativeMeta.metric();
+
+        SearchScope scope =
+                resolveScope(batchVectorSearch.includeRowIds(), batchVectorSearch.limit());
+        if (scope == null) {
+            return emptyResults(n);
+        }
+
+        float[] queries = flattenVectors(vectors, n, dim);
+        VectorSearchParams params = searchParams(batchVectorSearch.options(), scope.effectiveK);
+        VectorSearchBatchResult batchResult =
+                scope.filterBytes != null
+                        ? searchIvfPqCentroidBatch(
+                                queries, n, params, centroid, scope.filterBytes)
+                        : searchIvfPqCentroidBatch(queries, n, params, centroid);
+
         List<Optional<ScoredGlobalIndexResult>> results = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
             results.add(
@@ -201,6 +254,161 @@ public class NativeVectorGlobalIndexReader implements GlobalIndexReader {
                                 searchParams(vectorSearch.options(), scope.effectiveK));
 
         return buildScoredResult(result.ids(), result.distances(), metric).orElse(null);
+    }
+
+    Optional<ScoredGlobalIndexResult> searchCentroidShard(
+            VectorSearch vectorSearch,
+            int centroid,
+            NativeCentroidRoutedIndexReader.CentroidShardSearchMode searchMode)
+            throws IOException {
+        ensureLoaded();
+        if (searchMode == NativeCentroidRoutedIndexReader.CentroidShardSearchMode.ALL_LISTS) {
+            return Optional.ofNullable(search(withFullIvfProbe(vectorSearch)));
+        }
+
+        validateSearchVector(vectorSearch.vector());
+        float[] queryVector = vectorSearch.vector().clone();
+        String metric = nativeMeta.metric();
+
+        SearchScope scope = resolveScope(vectorSearch.includeRowIds(), vectorSearch.limit());
+        if (scope == null) {
+            return Optional.empty();
+        }
+
+        VectorSearchParams params = searchParams(vectorSearch.options(), scope.effectiveK);
+        VectorSearchResult result =
+                scope.filterBytes != null
+                        ? searchIvfPqCentroid(queryVector, params, centroid, scope.filterBytes)
+                        : searchIvfPqCentroid(queryVector, params, centroid);
+        return buildScoredResult(result.ids(), result.distances(), metric);
+    }
+
+    private VectorSearch withFullIvfProbe(VectorSearch vectorSearch) {
+        Map<String, String> options = new LinkedHashMap<>(vectorSearch.options());
+        options.remove(L_SEARCH_PARAMETER);
+        options.put(NPROBE_PARAMETER, Integer.toString(ivfListCount()));
+        VectorSearch fullProbeSearch =
+                new VectorSearch(
+                        vectorSearch.vector(), vectorSearch.limit(), vectorSearch.fieldName(), options);
+        if (vectorSearch.includeRowIds() != null) {
+            fullProbeSearch.withIncludeRowIds(vectorSearch.includeRowIds());
+        }
+        return fullProbeSearch;
+    }
+
+    private BatchVectorSearch withFullIvfProbe(BatchVectorSearch batchVectorSearch) {
+        Map<String, String> options = new LinkedHashMap<>(batchVectorSearch.options());
+        options.remove(L_SEARCH_PARAMETER);
+        options.put(NPROBE_PARAMETER, Integer.toString(ivfListCount()));
+        BatchVectorSearch fullProbeSearch =
+                new BatchVectorSearch(
+                        batchVectorSearch.vectors(),
+                        batchVectorSearch.limit(),
+                        batchVectorSearch.fieldName(),
+                        options);
+        if (batchVectorSearch.includeRowIds() != null) {
+            fullProbeSearch.withIncludeRowIds(batchVectorSearch.includeRowIds());
+        }
+        return fullProbeSearch;
+    }
+
+    private int ivfListCount() {
+        for (String methodName : new String[] {"nlist", "getNlist", "ivfListCount"}) {
+            try {
+                Method method = nativeMeta.getClass().getMethod(methodName);
+                Object result = method.invoke(nativeMeta);
+                if (result instanceof Number) {
+                    int nlist = ((Number) result).intValue();
+                    if (nlist > 0) {
+                        return nlist;
+                    }
+                }
+            } catch (NoSuchMethodException e) {
+                // Try the next common metadata accessor name.
+            } catch (IllegalAccessException e) {
+                throw new RuntimeException("Failed to access native vector index nlist metadata.", e);
+            } catch (InvocationTargetException e) {
+                throw rethrowInvocation("Failed to read native vector index nlist metadata.", e);
+            }
+        }
+        throw new IllegalStateException(
+                "Centroid shard search mode 'all-lists' requires native metadata to expose nlist.");
+    }
+
+    private VectorSearchResult searchIvfPqCentroid(
+            float[] queryVector, VectorSearchParams params, int centroid) {
+        return invokeRequired(
+                SEARCH_CENTROID_METHOD,
+                new Class<?>[] {float[].class, VectorSearchParams.class, int.class},
+                new Object[] {queryVector, params, centroid},
+                VectorSearchResult.class);
+    }
+
+    private VectorSearchResult searchIvfPqCentroid(
+            float[] queryVector, VectorSearchParams params, int centroid, byte[] filterBytes) {
+        return invokeRequired(
+                SEARCH_CENTROID_METHOD,
+                new Class<?>[] {float[].class, VectorSearchParams.class, int.class, byte[].class},
+                new Object[] {queryVector, params, centroid, filterBytes},
+                VectorSearchResult.class);
+    }
+
+    private VectorSearchBatchResult searchIvfPqCentroidBatch(
+            float[] queryVectors, int queryCount, VectorSearchParams params, int centroid) {
+        return invokeRequired(
+                SEARCH_CENTROID_BATCH_METHOD,
+                new Class<?>[] {float[].class, int.class, VectorSearchParams.class, int.class},
+                new Object[] {queryVectors, queryCount, params, centroid},
+                VectorSearchBatchResult.class);
+    }
+
+    private VectorSearchBatchResult searchIvfPqCentroidBatch(
+            float[] queryVectors,
+            int queryCount,
+            VectorSearchParams params,
+            int centroid,
+            byte[] filterBytes) {
+        return invokeRequired(
+                SEARCH_CENTROID_BATCH_METHOD,
+                new Class<?>[] {
+                    float[].class, int.class, VectorSearchParams.class, int.class, byte[].class
+                },
+                new Object[] {queryVectors, queryCount, params, centroid, filterBytes},
+                VectorSearchBatchResult.class);
+    }
+
+    private <T> T invokeRequired(
+            String methodName, Class<?>[] parameterTypes, Object[] args, Class<T> returnType) {
+        try {
+            Method method = vectorReader.getClass().getMethod(methodName, parameterTypes);
+            Object result = method.invoke(vectorReader, args);
+            return returnType.cast(result);
+        } catch (NoSuchMethodException e) {
+            throw new UnsupportedOperationException(
+                    "Centroid shard search mode 'forced-centroid' requires native API "
+                            + "VectorIndexReader."
+                            + methodName
+                            + "(...). Set option 'ivf.pq.centroid.search.mode=all-lists' "
+                            + "to use the compatibility path.",
+                    e);
+        } catch (IllegalAccessException e) {
+            throw new RuntimeException(
+                    "Failed to access native VectorIndexReader." + methodName + "(...).", e);
+        } catch (InvocationTargetException e) {
+            throw rethrowInvocation(
+                    "Failed to invoke native VectorIndexReader." + methodName + "(...).", e);
+        }
+    }
+
+    private static RuntimeException rethrowInvocation(String message, InvocationTargetException e) {
+        Throwable cause = e.getCause();
+        if (cause instanceof RuntimeException) {
+            return (RuntimeException) cause;
+        }
+        if (cause instanceof Error) {
+            throw (Error) cause;
+        }
+        return new RuntimeException(message, cause == null ? e : cause);
     }
 
     static Optional<ScoredGlobalIndexResult> buildScoredResult(
@@ -239,6 +447,14 @@ public class NativeVectorGlobalIndexReader implements GlobalIndexReader {
                             }
                             return score;
                         }));
+    }
+
+    private static float[] flattenVectors(float[][] vectors, int vectorCount, int dimension) {
+        float[] queries = new float[vectorCount * dimension];
+        for (int i = 0; i < vectorCount; i++) {
+            System.arraycopy(vectors[i], 0, queries, i * dimension, dimension);
+        }
+        return queries;
     }
 
     private static List<Optional<ScoredGlobalIndexResult>> emptyResults(int n) {
@@ -285,6 +501,9 @@ public class NativeVectorGlobalIndexReader implements GlobalIndexReader {
     }
 
     static VectorSearchParams searchParams(Map<String, String> parameters, int topK) {
+        if (parameters == null) {
+            parameters = Collections.emptyMap();
+        }
         Integer nprobe = intParameter(parameters, NPROBE_PARAMETER);
         Integer lSearch = intParameter(parameters, L_SEARCH_PARAMETER);
         Integer maxInitialFilterExpansionFactor =

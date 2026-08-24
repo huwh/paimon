@@ -36,6 +36,11 @@ import java.util.concurrent.CompletableFuture;
 public interface GlobalIndexReader
         extends FunctionVisitor<CompletableFuture<Optional<GlobalIndexResult>>>, Closeable {
 
+    /** Returns whether row ids produced by this reader are already absolute table row ids. */
+    default boolean returnsAbsoluteRowIds() {
+        return false;
+    }
+
     @Override
     default CompletableFuture<Optional<GlobalIndexResult>> visitIsNaN(FieldRef fieldRef) {
         return CompletableFuture.completedFuture(Optional.empty());

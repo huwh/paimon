@@ -19,6 +19,7 @@
 package org.apache.paimon.operation.commit;
 
 import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.index.IndexFileMeta;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.manifest.FileEntry;
 import org.apache.paimon.manifest.FileKind;
@@ -75,23 +76,23 @@ public class ManifestEntryChanges {
                 .deletedIndexFiles()
                 .forEach(
                         m ->
-                                appendIndexFiles.add(
-                                        new IndexManifestEntry(
-                                                FileKind.DELETE,
-                                                commitMessage.partition(),
-                                                commitMessage.bucket(),
-                                                m)));
+                                addIndexManifestEntries(
+                                        appendIndexFiles,
+                                        FileKind.DELETE,
+                                        commitMessage.partition(),
+                                        commitMessage.bucket(),
+                                        m));
         commitMessage
                 .newFilesIncrement()
                 .newIndexFiles()
                 .forEach(
                         m ->
-                                appendIndexFiles.add(
-                                        new IndexManifestEntry(
-                                                FileKind.ADD,
-                                                commitMessage.partition(),
-                                                commitMessage.bucket(),
-                                                m)));
+                                addIndexManifestEntries(
+                                        appendIndexFiles,
+                                        FileKind.ADD,
+                                        commitMessage.partition(),
+                                        commitMessage.bucket(),
+                                        m));
 
         commitMessage
                 .compactIncrement()
@@ -110,23 +111,32 @@ public class ManifestEntryChanges {
                 .deletedIndexFiles()
                 .forEach(
                         m ->
-                                compactIndexFiles.add(
-                                        new IndexManifestEntry(
-                                                FileKind.DELETE,
-                                                commitMessage.partition(),
-                                                commitMessage.bucket(),
-                                                m)));
+                                addIndexManifestEntries(
+                                        compactIndexFiles,
+                                        FileKind.DELETE,
+                                        commitMessage.partition(),
+                                        commitMessage.bucket(),
+                                        m));
         commitMessage
                 .compactIncrement()
                 .newIndexFiles()
                 .forEach(
                         m ->
-                                compactIndexFiles.add(
-                                        new IndexManifestEntry(
-                                                FileKind.ADD,
-                                                commitMessage.partition(),
-                                                commitMessage.bucket(),
-                                                m)));
+                                addIndexManifestEntries(
+                                        compactIndexFiles,
+                                        FileKind.ADD,
+                                        commitMessage.partition(),
+                                        commitMessage.bucket(),
+                                        m));
+    }
+
+    private static void addIndexManifestEntries(
+            List<IndexManifestEntry> target,
+            FileKind kind,
+            BinaryRow partition,
+            int bucket,
+            IndexFileMeta indexFile) {
+        target.add(new IndexManifestEntry(kind, partition, bucket, indexFile));
     }
 
     private ManifestEntry makeEntry(FileKind kind, CommitMessage commitMessage, DataFileMeta file) {

@@ -22,11 +22,13 @@ import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.GenericArray;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.globalindex.IndexFileKind;
 import org.apache.paimon.index.GlobalIndexMeta;
 import org.apache.paimon.index.IndexFileMeta;
 import org.apache.paimon.utils.ObjectSerializer;
 import org.apache.paimon.utils.OffsetRow;
 
+import java.nio.charset.StandardCharsets;
 import java.util.function.Function;
 
 import static org.apache.paimon.data.BinaryString.fromString;
@@ -70,13 +72,16 @@ public class IndexManifestEntrySerializer extends ObjectSerializer<IndexManifest
                 record.kind().toByteValue(),
                 serializeBinaryRow(record.partition()),
                 record.bucket(),
-                fromString(indexFile.indexType()),
+                fromString(record.indexType()),
                 fromString(indexFile.fileName()),
                 indexFile.fileSize(),
                 indexFile.rowCount(),
                 dvMetasToRowArrayData(indexFile.dvRanges()),
                 fromString(indexFile.externalPath()),
-                globalIndexRow);
+                globalIndexRow,
+                indexFile.fileKind() == IndexFileKind.DATA
+                        ? null
+                        : fromString(indexFile.fileKind().name()));
     }
 
     @Override
@@ -93,6 +98,7 @@ public class IndexManifestEntrySerializer extends ObjectSerializer<IndexManifest
 
     private IndexManifestEntry fromDataRow(InternalRow row) {
         GlobalIndexMeta globalIndexMeta = null;
+        IndexFileKind indexFileKind = IndexFileKind.DATA;
         if (!row.isNullAt(9)) {
             InternalRow globalIndexRow = row.getRow(9, GlobalIndexMeta.SCHEMA.getFieldCount());
             long rowRangeStart = globalIndexRow.getLong(0);
@@ -102,6 +108,10 @@ public class IndexManifestEntrySerializer extends ObjectSerializer<IndexManifest
                     globalIndexRow.isNullAt(3) ? null : globalIndexRow.getArray(3).toIntArray();
             byte[] indexMeta = globalIndexRow.isNullAt(4) ? null : globalIndexRow.getBinary(4);
             byte[] sourceMeta = globalIndexRow.isNullAt(5) ? null : globalIndexRow.getBinary(5);
+            if (isLegacyRoutingModelIndexMeta(indexMeta)) {
+                indexFileKind = IndexFileKind.ROUTING_MODEL;
+                indexMeta = stripLegacyFileKind(indexMeta);
+            }
             globalIndexMeta =
                     new GlobalIndexMeta(
                             rowRangeStart,
@@ -110,6 +120,9 @@ public class IndexManifestEntrySerializer extends ObjectSerializer<IndexManifest
                             extralFields,
                             indexMeta,
                             sourceMeta);
+        }
+        if (row.getFieldCount() > 10 && !row.isNullAt(10)) {
+            indexFileKind = IndexFileKind.valueOf(row.getString(10).toString());
         }
 
         return new IndexManifestEntry(
@@ -123,7 +136,52 @@ public class IndexManifestEntrySerializer extends ObjectSerializer<IndexManifest
                         row.getLong(6),
                         row.isNullAt(7) ? null : rowArrayDataToDvMetas(row.getArray(7)),
                         row.isNullAt(8) ? null : row.getString(8).toString(),
-                        globalIndexMeta));
+                        globalIndexMeta,
+                        indexFileKind));
+    }
+
+    private static int globalIndexFieldCount(int version) {
+        if (version == 1) {
+            return 5;
+        }
+        if (version == 2) {
+            return 6;
+        }
+        if (version == 3 || version == 4) {
+            return 8;
+        }
+        return 6;
+    }
+
+    private static byte[] routingModelIndexMeta(String shardMode) {
+        String effectiveShardMode =
+                shardMode == null || shardMode.isEmpty() ? "centroid-based" : shardMode;
+        return ("{\"shardMode\":\"" + effectiveShardMode + "\"}").getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static boolean isLegacyRoutingModelIndexMeta(byte[] indexMeta) {
+        if (indexMeta == null) {
+            return false;
+        }
+        String meta = new String(indexMeta, StandardCharsets.UTF_8);
+        return meta.contains("\"fileKind\":\"ROUTING_MODEL\"")
+                || meta.contains("\"fileKind\" : \"ROUTING_MODEL\"");
+    }
+
+    private static byte[] stripLegacyFileKind(byte[] indexMeta) {
+        String meta = new String(indexMeta, StandardCharsets.UTF_8);
+        String shardMode = null;
+        String key = "\"shardMode\"";
+        int keyPos = meta.indexOf(key);
+        if (keyPos >= 0) {
+            int colon = meta.indexOf(':', keyPos + key.length());
+            int firstQuote = colon < 0 ? -1 : meta.indexOf('"', colon + 1);
+            int secondQuote = firstQuote < 0 ? -1 : meta.indexOf('"', firstQuote + 1);
+            if (secondQuote > firstQuote) {
+                shardMode = meta.substring(firstQuote + 1, secondQuote);
+            }
+        }
+        return routingModelIndexMeta(shardMode);
     }
 
     public static Function<InternalRow, BinaryRow> partitionGetter() {
