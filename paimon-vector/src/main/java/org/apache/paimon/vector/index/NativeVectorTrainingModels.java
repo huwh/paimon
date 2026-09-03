@@ -20,11 +20,11 @@ package org.apache.paimon.vector.index;
 
 import org.apache.paimon.globalindex.GlobalIndexIOMeta;
 import org.apache.paimon.globalindex.io.GlobalIndexFileReader;
-import org.apache.paimon.utils.IOUtils;
 
 import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.Collections;
 
 /** Utilities for loading persisted native vector training models. */
@@ -37,36 +37,62 @@ public class NativeVectorTrainingModels {
     public static VectorTrainingModel load(
             GlobalIndexFileReader fileReader, GlobalIndexIOMeta globalIndexFile)
             throws IOException {
-        byte[] fileBytes;
-        try (org.apache.paimon.fs.SeekableInputStream in = fileReader.getInputStream(globalIndexFile)) {
-            fileBytes = IOUtils.readFully(in, false);
+        try (org.apache.paimon.fs.SeekableInputStream in =
+                fileReader.getInputStream(globalIndexFile)) {
+            return loadArtifact(in, globalIndexFile.fileSize());
         }
-
-        VectorGlobalIndexFileMeta.deserialize(fileBytes);
-        byte[] payload = nativePayload(fileBytes);
-        return NativeVectorGlobalModelTrainers.NativeVectorTrainingModel.load(
-                IVF_PQ_NATIVE_INDEX_TYPE, Collections.emptyMap(), new ByteArrayInputStream(payload));
     }
 
     public static VectorTrainingModel load(byte[] fileBytes) throws IOException {
-        VectorGlobalIndexFileMeta.deserialize(fileBytes);
-        byte[] payload = nativePayload(fileBytes);
-        return NativeVectorGlobalModelTrainers.NativeVectorTrainingModel.load(
-                IVF_PQ_NATIVE_INDEX_TYPE, Collections.emptyMap(), new ByteArrayInputStream(payload));
-    }
-
-    private static byte[] nativePayload(byte[] fileBytes) throws IOException {
-        try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(fileBytes))) {
-            int metadataLength = in.readInt();
-            if (metadataLength <= 0 || metadataLength > fileBytes.length - Integer.BYTES) {
-                throw new IllegalArgumentException(
-                        "Invalid vector global index metadata length: " + metadataLength);
-            }
-            int payloadOffset = Integer.BYTES + metadataLength;
-            byte[] payload = new byte[fileBytes.length - payloadOffset];
-            System.arraycopy(fileBytes, payloadOffset, payload, 0, payload.length);
-            return payload;
+        try (ByteArrayInputStream in = new ByteArrayInputStream(fileBytes)) {
+            return loadArtifact(in, fileBytes.length);
         }
     }
 
+    private static VectorTrainingModel loadArtifact(InputStream in, long artifactSize)
+            throws IOException {
+        VectorGlobalIndexFileMeta.ArtifactHeader header =
+                VectorGlobalIndexFileMeta.readArtifactHeader(in, artifactSize);
+        byte[] payload = readPayload(in, header.payloadSize());
+        String actualDigest = VectorModelDigest.sha256(payload);
+        if (header.metadata().hasModelIdentity()
+                && !header.metadata().modelDigest().equals(actualDigest)) {
+            throw new IOException(
+                    "Vector training model digest mismatch: expected "
+                            + header.metadata().modelDigest()
+                            + ", but was "
+                            + actualDigest);
+        }
+        VectorTrainingModel model =
+                NativeVectorGlobalModelTrainers.NativeVectorTrainingModel.load(
+                        IVF_PQ_NATIVE_INDEX_TYPE, Collections.emptyMap(), payload);
+        int actualNlist = model.centroids().nlist();
+        if (header.metadata().hasModelIdentity() && actualNlist != header.metadata().nlist()) {
+            try {
+                model.close();
+            } catch (IOException closeFailure) {
+                // The metadata mismatch remains the actionable failure.
+            }
+            throw new IOException(
+                    "Vector training model nlist mismatch: expected "
+                            + header.metadata().nlist()
+                            + ", but was "
+                            + actualNlist);
+        }
+        return model;
+    }
+
+    private static byte[] readPayload(InputStream in, long payloadSize) throws IOException {
+        if (payloadSize <= 0 || payloadSize > Integer.MAX_VALUE) {
+            throw new IOException("Unsupported vector training model payload size: " + payloadSize);
+        }
+        byte[] payload = new byte[(int) payloadSize];
+        DataInputStream dataInput =
+                in instanceof DataInputStream ? (DataInputStream) in : new DataInputStream(in);
+        dataInput.readFully(payload);
+        if (dataInput.read() != -1) {
+            throw new IOException("Vector training model artifact contains trailing bytes.");
+        }
+        return payload;
+    }
 }

@@ -19,15 +19,30 @@
 package org.apache.paimon.spark.globalindex;
 
 import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.data.BinaryRowWriter;
+import org.apache.paimon.data.BinaryVector;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.globalindex.IndexedSplit;
 import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.io.DataIncrement;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.spark.globalindex.sorted.SortedIndexTopoBuilder;
 import org.apache.paimon.stats.SimpleStats;
+import org.apache.paimon.table.BucketMode;
+import org.apache.paimon.table.SpecialFields;
+import org.apache.paimon.table.sink.CommitMessage;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.FloatType;
 import org.apache.paimon.types.IntType;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.types.VectorType;
+import org.apache.paimon.utils.CloseableIterator;
+import org.apache.paimon.utils.InstantiationUtil;
 import org.apache.paimon.utils.Range;
+import org.apache.paimon.vector.index.VectorGlobalModelTrainer;
+import org.apache.paimon.vector.index.VectorTrainingModel;
 
 import org.junit.jupiter.api.Test;
 
@@ -36,10 +51,12 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import static org.apache.paimon.CoreOptions.GLOBAL_INDEX_BUILD_MAX_PARALLELISM;
 import static org.apache.paimon.CoreOptions.GLOBAL_INDEX_ROW_COUNT_PER_SHARD;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.CENTROID_ASSIGN_LAZY_STREAMING_OPTION;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -99,6 +116,45 @@ public class DefaultGlobalIndexTopoBuilderTest {
     }
 
     @Test
+    void testCentroidAssignmentStreamingIsSafeByDefault() {
+        assertThat(DefaultGlobalIndexTopoBuilder.centroidAssignLazyStreaming(new Options()))
+                .isTrue();
+
+        Options disabled =
+                new Options(
+                        Collections.singletonMap(CENTROID_ASSIGN_LAZY_STREAMING_OPTION, "false"));
+        assertThat(DefaultGlobalIndexTopoBuilder.centroidAssignLazyStreaming(disabled)).isFalse();
+    }
+
+    @Test
+    void testCentroidBuildRequiresBucketUnawareTable() {
+        CentroidShardedIvfPqIndexBuildPlanner.validateBucketMode(
+                BucketMode.BUCKET_UNAWARE, "T");
+
+        assertThatThrownBy(
+                        () ->
+                                CentroidShardedIvfPqIndexBuildPlanner.validateBucketMode(
+                                        BucketMode.HASH_FIXED, "T"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("bucket-unaware")
+                .hasMessageContaining("HASH_FIXED");
+    }
+
+    @Test
+    void testCentroidSelectedPartitionMustCoverCompleteTableRowIds() {
+        CentroidShardedIvfPqIndexBuildPlanner.validateSelectedPartitionCoverage(
+                20L, Arrays.asList(new Range(0, 9), new Range(10, 19)));
+
+        assertThatThrownBy(
+                        () ->
+                                CentroidShardedIvfPqIndexBuildPlanner
+                                        .validateSelectedPartitionCoverage(
+                                                20L, Collections.singletonList(new Range(0, 9))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("complete table row-id range");
+    }
+
+    @Test
     void testLimitSplitsToTrainingSampleRowsSelectsFilesByFileMetaRowCount() {
         IndexedSplit split =
                 indexedSplit(
@@ -112,9 +168,181 @@ public class DefaultGlobalIndexTopoBuilderTest {
                 DefaultGlobalIndexTopoBuilder.limitSplitsToTrainingSampleRows(
                         Collections.singletonList(split), 30);
 
-        assertThat(sampledSplits).hasSize(1);
-        assertThat(fileNames(sampledSplits.get(0)))
-                .containsExactly("file-0", "file-1", "file-2");
+        assertThat(sampledSplits).hasSize(3);
+        assertThat(
+                        sampledSplits.stream()
+                                .flatMap(sampled -> fileNames(sampled).stream())
+                                .collect(Collectors.toList()))
+                .hasSize(3)
+                .doesNotHaveDuplicates();
+    }
+
+    @Test
+    void testLimitSplitsStopsWhenRowLimitIsReachedExactly() {
+        IndexedSplit split =
+                indexedSplit(
+                        "bucket-0",
+                        dataFile("file-0", 10, 0),
+                        dataFile("file-1", 10, 10),
+                        dataFile("file-2", 10, 20));
+
+        List<IndexedSplit> sampledSplits =
+                DefaultGlobalIndexTopoBuilder.limitSplitsToTrainingSampleRows(
+                        Collections.singletonList(split), 20);
+
+        assertThat(sampledSplits).hasSize(2);
+    }
+
+    @Test
+    void testExpectedVectorCountUsesAllFilesAndSaturates() {
+        IndexedSplit first =
+                indexedSplit(
+                        "bucket-0",
+                        dataFile("file-0", Long.MAX_VALUE - 5, 0),
+                        dataFile("file-1", 10, 1));
+
+        assertThat(
+                        DefaultGlobalIndexTopoBuilder.expectedVectorCount(
+                                Collections.singletonList(first)))
+                .isEqualTo(Long.MAX_VALUE);
+    }
+
+    @Test
+    void testConfigureExpectedVectorCountForAutoNlist() {
+        Map<String, String> nativeOptions = new HashMap<>();
+        nativeOptions.put("nlist", "auto");
+
+        DefaultGlobalIndexTopoBuilder.configureExpectedVectorCount(nativeOptions, 1234);
+
+        assertThat(nativeOptions).containsEntry("expected-vector-count", "1234");
+    }
+
+    @Test
+    void testConfigureExpectedVectorCountPreservesExplicitValue() {
+        Map<String, String> nativeOptions = new HashMap<>();
+        nativeOptions.put("expected-vector-count", "99");
+
+        DefaultGlobalIndexTopoBuilder.configureExpectedVectorCount(nativeOptions, 1234);
+
+        assertThat(nativeOptions).containsEntry("expected-vector-count", "99");
+    }
+
+    @Test
+    void testCentroidNativeOptionsForwardIvfPqTuning() {
+        Map<String, String> optionMap = new HashMap<>();
+        optionMap.put("ivf-pq.pq.code-ratio", "0.125");
+        optionMap.put("ivf-pq.target-recall", "0.95");
+        optionMap.put("ivf-pq.max-bytes-per-vector", "32");
+        optionMap.put("ivf-pq.deployment-profile", "remote");
+        optionMap.put("ivf-pq.use-opq", "true");
+        optionMap.put("fields.vec.use-opq", "false");
+
+        Map<String, String> nativeOptions =
+                CentroidShardedIvfPqIndexBuilder.nativeOptions(
+                        "ivf-pq",
+                        new DataField(0, "vec", new VectorType(8, new FloatType())),
+                        new Options(optionMap));
+
+        assertThat(nativeOptions)
+                .containsEntry("pq.code-ratio", "0.125")
+                .containsEntry("target-recall", "0.95")
+                .containsEntry("max-bytes-per-vector", "32")
+                .containsEntry("deployment-profile", "remote")
+                .containsEntry("use-opq", "false");
+    }
+
+    @Test
+    void testCentroidPartitionerBoundsPhysicalPartitions() {
+        DefaultGlobalIndexTopoBuilder.CentroidPartitioner partitioner =
+                new DefaultGlobalIndexTopoBuilder.CentroidPartitioner(1000, 8);
+
+        assertThat(partitioner.numPartitions()).isEqualTo(8);
+        assertThat(partitioner.getPartition(0)).isZero();
+        assertThat(partitioner.getPartition(8)).isZero();
+        assertThat(partitioner.getPartition(999)).isEqualTo(7);
+        assertThatThrownBy(() -> partitioner.getPartition(1000))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("out of range");
+    }
+
+    @Test
+    void testCentroidCommitUsesLogicalPartitionAndSyntheticBucket() {
+        BinaryRow partition = partition(17);
+
+        CommitMessage message =
+                DefaultGlobalIndexTopoBuilder.centroidCommitMessage(
+                        partition, DataIncrement.emptyIncrement());
+
+        assertThat(message.partition()).isEqualTo(partition);
+        assertThat(message.bucket()).isZero();
+    }
+
+    @Test
+    void testClosingIteratorTaskCompletionCloseIsIdempotent() {
+        AtomicInteger closeCount = new AtomicInteger();
+        DefaultGlobalIndexTopoBuilder.ClosingIterator<Integer> iterator =
+                new DefaultGlobalIndexTopoBuilder.ClosingIterator<>(
+                        Collections.singletonList(1).iterator(), closeCount::incrementAndGet);
+
+        assertThat(iterator.next()).isEqualTo(1);
+        iterator.closeFromTaskCompletion();
+        iterator.closeFromTaskCompletion();
+
+        assertThat(closeCount).hasValue(1);
+    }
+
+    @Test
+    void testTrainingSamplesAreStreamedWithExactLimit() throws Exception {
+        DataField vectorField = new DataField(0, "vec", new VectorType(2, new FloatType()));
+        RowType readType = RowType.of(vectorField, SpecialFields.ROW_ID);
+        CentroidShardedIvfPqIndexBuilder builder =
+                CentroidShardedIvfPqIndexBuilder.forTrainingSamples(
+                        null, readType, vectorField, Collections.singletonList(new Range(0, 10)));
+        CloseableIterator<InternalRow> rows =
+                CloseableIterator.adapterForIterator(
+                        Arrays.<InternalRow>asList(
+                                        GenericRow.of(
+                                                BinaryVector.fromPrimitiveArray(new float[] {1, 2}),
+                                                0L),
+                                        GenericRow.of(
+                                                BinaryVector.fromPrimitiveArray(new float[] {3, 4}),
+                                                1L),
+                                        GenericRow.of(
+                                                BinaryVector.fromPrimitiveArray(new float[] {5, 6}),
+                                                2L))
+                                .iterator());
+        CountingTrainer trainer = new CountingTrainer();
+
+        assertThat(builder.writeTrainingSamples(rows, trainer, 2)).isEqualTo(2);
+        assertThat(trainer.count).isEqualTo(2);
+        assertThat(rows.hasNext()).isTrue();
+    }
+
+    @Test
+    void testBroadcastAssignmentBuilderDoesNotSerializeModelPayload() throws Exception {
+        DataField vectorField = new DataField(0, "vec", new VectorType(2, new FloatType()));
+        CentroidShardedIvfPqIndexBuilder broadcastBuilder =
+                CentroidShardedIvfPqIndexBuilder.forCentroidAssignment(
+                        null,
+                        RowType.of(vectorField, SpecialFields.ROW_ID),
+                        vectorField,
+                        Collections.singletonList(new Range(0, 10)),
+                        "native",
+                        "ivf-pq",
+                        Collections.emptyMap());
+        CentroidShardedIvfPqIndexBuilder embeddedPayloadBuilder =
+                CentroidShardedIvfPqIndexBuilder.forCentroidAssignment(
+                        null,
+                        RowType.of(vectorField, SpecialFields.ROW_ID),
+                        vectorField,
+                        Collections.singletonList(new Range(0, 10)),
+                        "native",
+                        "ivf-pq",
+                        Collections.emptyMap(),
+                        new byte[1024 * 1024]);
+
+        assertThat(InstantiationUtil.serializeObject(broadcastBuilder).length)
+                .isLessThan(InstantiationUtil.serializeObject(embeddedPayloadBuilder).length / 100);
     }
 
     @Test
@@ -165,5 +393,31 @@ public class DefaultGlobalIndexTopoBuilderTest {
         return split.dataSplit().dataFiles().stream()
                 .map(DataFileMeta::fileName)
                 .collect(Collectors.toList());
+    }
+
+    private static BinaryRow partition(int value) {
+        BinaryRow partition = new BinaryRow(1);
+        BinaryRowWriter writer = new BinaryRowWriter(partition);
+        writer.writeInt(0, value);
+        writer.complete();
+        return partition;
+    }
+
+    private static class CountingTrainer implements VectorGlobalModelTrainer {
+
+        private int count;
+
+        @Override
+        public void write(Object vector, long absoluteRowId) {
+            count++;
+        }
+
+        @Override
+        public VectorTrainingModel finishTraining() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void close() {}
     }
 }

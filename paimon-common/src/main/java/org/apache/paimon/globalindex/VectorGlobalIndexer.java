@@ -57,4 +57,20 @@ public interface VectorGlobalIndexer extends GlobalIndexer {
     default boolean acceptsRoutedIndexFile(byte[] indexMeta, Set<Integer> routedCentroids) {
         return false;
     }
+
+    /**
+     * Returns whether an index file belongs to a routed shard of the supplied routing model.
+     *
+     * <p>The routing metadata parameter lets implementations reject data files produced by a
+     * different model generation, even when both generations use the same shard ids.
+     */
+    default boolean acceptsRoutedIndexFile(
+            byte[] routingIndexMeta, byte[] indexMeta, Set<Integer> routedCentroids) {
+        return acceptsRoutedIndexFile(indexMeta, routedCentroids);
+    }
+
+    /** Returns whether an index data file was produced from the supplied routing model. */
+    default boolean isCompatibleRoutedIndexFile(byte[] routingIndexMeta, byte[] indexMeta) {
+        return true;
+    }
 }

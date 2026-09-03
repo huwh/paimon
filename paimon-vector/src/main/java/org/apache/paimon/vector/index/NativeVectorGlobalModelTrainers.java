@@ -30,15 +30,9 @@ import org.apache.paimon.index.vector.VectorIndexWriter;
 
 import javax.annotation.Nullable;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.OutputStream;
-import java.lang.reflect.Constructor;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -57,7 +51,7 @@ public class NativeVectorGlobalModelTrainers {
 
     public static VectorTrainingModel load(
             String indexType, Map<String, String> options, byte[] payload) throws IOException {
-        return NativeVectorTrainingModel.load(indexType, options, new ByteArrayInputStream(payload));
+        return NativeVectorTrainingModel.load(indexType, options, payload.clone());
     }
 
     /**
@@ -66,11 +60,8 @@ public class NativeVectorGlobalModelTrainers {
      * <p>This class is intentionally not a placeholder. It owns the same Java-side work as {@link
      * NativeVectorGlobalIndexWriter}: validate/materialize vectors, batch them, feed the existing
      * native {@link VectorIndexTrainer}, and convert the native training result into a Paimon
-     * {@link VectorTrainingModel}. The native dependencies after {@link
-     * VectorIndexTrainer#finishTraining()} are implemented explicitly by {@link
-     * NativeGlobalTrainingModelOps}; paimon-vector-index-java must expose the corresponding routing
-     * methods plus serde methods on {@link VectorIndexTraining} for this class to run the centroid
-     * path.
+     * {@link VectorTrainingModel}. Native model persistence, routing, and centroid shard writing
+     * use the public paimon-vector-index Java API directly.
      */
     private static class NativeVectorTrainingModelWriter
             implements VectorTrainingModelWriter, Closeable {
@@ -128,12 +119,14 @@ public class NativeVectorGlobalModelTrainers {
                                 + "' requires at least one non-null training vector.");
             }
 
-            flushTrainingBatch();
-            VectorIndexTraining training = trainer.finishTraining();
-            closeTrainerQuietly();
-            batchVectors = null;
-            return new NativeVectorTrainingModel(
-                    indexType, options, training, NativeGlobalTrainingModelOps.NATIVE);
+            try {
+                flushTrainingBatch();
+                VectorIndexTraining training = trainer.finishTraining();
+                return new NativeVectorTrainingModel(indexType, options, training);
+            } finally {
+                batchVectors = null;
+                closeTrainerQuietly();
+            }
         }
 
         @Override
@@ -196,7 +189,8 @@ public class NativeVectorGlobalModelTrainers {
                 }
                 return vectorBuf;
             }
-            throw new RuntimeException("Unsupported vector type: " + fieldData.getClass().getName());
+            throw new RuntimeException(
+                    "Unsupported vector type: " + fieldData.getClass().getName());
         }
 
         private void checkDimension(int actualDim) {
@@ -219,7 +213,8 @@ public class NativeVectorGlobalModelTrainers {
 
         private void ensureNotFinished() {
             if (finished) {
-                throw new IllegalStateException("Native vector global model training has finished.");
+                throw new IllegalStateException(
+                        "Native vector global model training has finished.");
             }
         }
 
@@ -231,11 +226,13 @@ public class NativeVectorGlobalModelTrainers {
     private static int parseDimension(Map<String, String> options) {
         String dimension = options.get("dimension");
         if (dimension == null) {
-            throw new IllegalArgumentException("Native vector training requires option 'dimension'.");
+            throw new IllegalArgumentException(
+                    "Native vector training requires option 'dimension'.");
         }
         int dim = Integer.parseInt(dimension);
         if (dim <= 0) {
-            throw new IllegalArgumentException("Native vector training requires positive dimension.");
+            throw new IllegalArgumentException(
+                    "Native vector training requires positive dimension.");
         }
         return dim;
     }
@@ -246,44 +243,40 @@ public class NativeVectorGlobalModelTrainers {
         private Map<String, String> options;
         private transient VectorIndexTraining training;
         private transient byte[] serializedTraining;
-        private transient NativeGlobalTrainingModelOps nativeOps;
+        private transient String modelDigest;
 
         private NativeVectorTrainingModel(
-                String indexType,
-                Map<String, String> options,
-                VectorIndexTraining training,
-                NativeGlobalTrainingModelOps nativeOps) {
+                String indexType, Map<String, String> options, VectorIndexTraining training) {
             this.indexType = indexType;
             this.options = new LinkedHashMap<>(options);
             this.training = training;
-            this.nativeOps = nativeOps;
         }
 
         static NativeVectorTrainingModel load(
-                String indexType, Map<String, String> options, InputStream payload)
-                throws IOException {
-            byte[] serializedTraining = readFully(payload);
+                String indexType, Map<String, String> options, byte[] payload) {
             NativeVectorTrainingModel model =
                     new NativeVectorTrainingModel(
-                            indexType,
-                            options,
-                            NativeGlobalTrainingModelOps.NATIVE.deserialize(
-                                    serializedTraining, options),
-                            NativeGlobalTrainingModelOps.NATIVE);
-            model.serializedTraining = serializedTraining;
+                            indexType, options, VectorIndexTraining.deserialize(payload));
+            model.serializedTraining = payload;
             return model;
         }
 
         @Override
         public VectorCentroidModel centroids() {
-            return new NativeVectorCentroidModel(options, training(), nativeOps);
+            return new NativeVectorCentroidModel(training());
+        }
+
+        @Override
+        public String modelDigest() throws IOException {
+            if (modelDigest == null) {
+                modelDigest = VectorModelDigest.sha256(serializedTraining());
+            }
+            return modelDigest;
         }
 
         @Override
         public GlobalIndexSingleColumnWriter createCentroidShardIndexWriter(
-                GlobalIndexFileWriter fileWriter,
-                int centroid,
-                Map<String, String> options) {
+                GlobalIndexFileWriter fileWriter, int centroid, Map<String, String> options) {
             return new NativeCentroidShardIndexWriter(fileWriter, this, centroid, options);
         }
 
@@ -293,12 +286,12 @@ public class NativeVectorGlobalModelTrainers {
         }
 
         VectorIndexWriter createIvfPqCentroidShardWriter(int centroid) {
-            return nativeOps.createCentroidShardWriter(training(), centroid, options);
+            return new VectorIndexWriter(training(), centroid);
         }
 
         void addIvfPqCentroidVectors(
                 VectorIndexWriter writer, long[] ids, float[] vectors, int vectorCount) {
-            nativeOps.addIvfPqCentroidVectors(writer, ids, vectors, vectorCount, options);
+            writer.addIvfPqCentroidVectors(ids, vectors, vectorCount);
         }
 
         @Override
@@ -311,7 +304,7 @@ public class NativeVectorGlobalModelTrainers {
 
         private byte[] serializedTraining() throws IOException {
             if (serializedTraining == null) {
-                serializedTraining = nativeOps.serialize(training(), options);
+                serializedTraining = training().serialize();
             }
             return serializedTraining;
         }
@@ -326,317 +319,30 @@ public class NativeVectorGlobalModelTrainers {
 
     private static class NativeVectorCentroidModel implements VectorCentroidModel {
 
-        private final Map<String, String> options;
         private final VectorIndexTraining training;
-        private final NativeGlobalTrainingModelOps nativeOps;
 
-        private NativeVectorCentroidModel(
-                Map<String, String> options,
-                VectorIndexTraining training,
-                NativeGlobalTrainingModelOps nativeOps) {
-            this.options = new LinkedHashMap<>(options);
+        private NativeVectorCentroidModel(VectorIndexTraining training) {
             this.training = training;
-            this.nativeOps = nativeOps;
         }
 
         @Override
         public int nlist() {
-            return parsePositiveOption(options, "nlist");
+            int nlist = training.nlist();
+            if (nlist <= 0) {
+                throw new IllegalStateException(
+                        "Native vector training returned non-positive nlist: " + nlist);
+            }
+            return nlist;
         }
 
         @Override
         public int assignCentroid(float[] vector) {
-            return nativeOps.assignCentroid(training, vector, options);
+            return training.assignCentroid(vector);
         }
 
         @Override
         public int[] nearestCentroids(float[] queryVector, int nprobe) {
-            return nativeOps.findNearestCentroids(training, queryVector, nprobe, options);
+            return training.findNearestCentroids(queryVector, nprobe);
         }
-
-        private static int parsePositiveOption(Map<String, String> options, String key) {
-            String value = options.get(key);
-            if (value == null) {
-                throw new IllegalArgumentException(
-                        "Native vector training requires option '" + key + "'.");
-            }
-            int parsed = Integer.parseInt(value);
-            if (parsed <= 0) {
-                throw new IllegalArgumentException(
-                        "Native vector training requires positive option '" + key + "'.");
-            }
-            return parsed;
-        }
-    }
-
-    /**
-     * Boundary for native operations which are required by centroid-id sharded IVF/PQ global
-     * indexes.
-     *
-     * <p>This is not an unsupported placeholder. It is the concrete Paimon adapter around the
-     * paimon-vector-index Java binding contract. The implementation below calls explicit APIs from
-     * the Java binding. Operations which naturally belong to the training model, such as centroid
-     * routing, stay on {@link VectorIndexTraining}. Centroid shard materialization is exposed as a
-     * direct {@link VectorIndexWriter} constructor receiving the global training model and centroid.
-     * Metadata needed by Paimon is derived from Java-side options to avoid
-     * introducing unnecessary native APIs.
-     * Persistence stays on {@link VectorIndexTraining}; Spark carries the serialized training-model
-     * payload between stages, and each JVM recreates a fresh native handle from those bytes. A Java
-     * object containing only a native pointer is not valid in another JVM. The adapter invokes these
-     * APIs reflectively so this module can still compile while the paimon-vector-index Java binding is
-     * being upgraded; using the centroid path with an older binding fails fast with a clear runtime
-     * error that names the missing method or constructor.
-     *
-     * <p>Required paimon-vector-index Java binding additions:
-     *
-     * <pre>{@code
-     * public final class VectorIndexTraining implements AutoCloseable {
-     *     public byte[] serialize();
-     *
-     *     public static VectorIndexTraining deserialize(byte[] serializedTraining);
-     *
-     *     public int assignCentroid(float[] vector);
-     *
-     *     public int[] findNearestCentroids(float[] query, int nprobe);
-     * }
-     *
-     * public final class VectorIndexWriter implements AutoCloseable {
-     *     public VectorIndexWriter(VectorIndexTraining training, int centroid);
-     *
-     *     public void addIvfPqCentroidVectors(
-     *             long[] ids,
-     *             float[] vectors,
-     *             int vectorCount);
-     * }
-     * }</pre>
-     */
-    interface NativeGlobalTrainingModelOps {
-
-        NativeGlobalTrainingModelOps NATIVE = new VectorIndexTrainingNativeGlobalModelOps();
-
-        /**
-         * Serializes the full native global training model.
-         *
-         * <p>Purpose: store the partition-level model next to centroid shard file metadata, and
-         * serialize the model across Spark tasks when needed.
-         *
-         * @param training closeable native training model to serialize
-         * @param options native index options used to disambiguate the payload format
-         *     <p>The returned bytes are a self-contained payload consumable by {@link
-         *     #deserialize(byte[], Map)}.
-         */
-        byte[] serialize(VectorIndexTraining training, Map<String, String> options) throws IOException;
-
-        /**
-         * Assigns one build-side vector to its closest IVF centroid.
-         *
-         * <p>Purpose: shuffle table rows into deterministic per-centroid shard builders.
-         *
-         * @param training closeable native global training model
-         * @param vector dense float vector whose length equals the configured dimension
-         * @param options native index options used by the training model
-         * @return zero-based centroid in [0, nlist)
-         */
-        int assignCentroid(VectorIndexTraining training, float[] vector, Map<String, String> options);
-
-        /**
-         * Selects centroid shards which may contain nearest neighbours for a query vector.
-         *
-         * <p>Purpose: query-side routing so readers open only relevant centroid shard files.
-         *
-         * @param training closeable native global training model
-         * @param queryVector dense query vector whose length equals vector dimension
-         * @param nprobe requested number of IVF centroids to probe; must be positive
-         * @param options native index options used by the training model
-         * @return distinct zero-based centroids, ordered by native routing priority, with length
-         *     at most min(nprobe, nlist)
-         */
-        int[] findNearestCentroids(
-                VectorIndexTraining training,
-                float[] queryVector,
-                int nprobe,
-                Map<String, String> options);
-
-        /** Creates a native writer for one centroid shard from a global training model. */
-        VectorIndexWriter createCentroidShardWriter(
-                VectorIndexTraining training, int centroid, Map<String, String> options);
-
-        /** Adds a batch of absolute row ids and vectors to a centroid shard writer. */
-        void addIvfPqCentroidVectors(
-                VectorIndexWriter writer,
-                long[] ids,
-                float[] vectors,
-                int vectorCount,
-                Map<String, String> options);
-
-        /**
-         * Loads a persisted native global training model.
-         *
-         * <p>Purpose: recreate the model on query-side readers and across serialized build tasks.
-         *
-         * @param payload bytes previously produced by {@link #serialize(VectorIndexTraining, Map)}
-         * @param options native index options used to disambiguate the payload format
-         * @return closeable native global training model that supports metadata, centroid routing
-         *     and serialized centroid shard writing
-         */
-        VectorIndexTraining deserialize(byte[] payload, Map<String, String> options) throws IOException;
-    }
-
-    private static class VectorIndexTrainingNativeGlobalModelOps
-            implements NativeGlobalTrainingModelOps {
-
-        @Override
-        public byte[] serialize(VectorIndexTraining training, Map<String, String> options)
-                throws IOException {
-            return invokeRequired(
-                    training,
-                    "serialize",
-                    new Class<?>[0],
-                    new Object[0],
-                    byte[].class);
-        }
-
-        @Override
-        public int assignCentroid(
-                VectorIndexTraining training, float[] vector, Map<String, String> options) {
-            Integer centroid =
-                    invokeRequired(
-                            training,
-                            "assignCentroid",
-                            new Class<?>[] {float[].class},
-                            new Object[] {vector},
-                            Integer.class);
-            return centroid;
-        }
-
-        @Override
-        public int[] findNearestCentroids(
-                VectorIndexTraining training,
-                float[] queryVector,
-                int nprobe,
-                Map<String, String> options) {
-            return invokeRequired(
-                    training,
-                    "findNearestCentroids",
-                    new Class<?>[] {float[].class, int.class},
-                    new Object[] {queryVector, nprobe},
-                    int[].class);
-        }
-
-        @Override
-        public VectorIndexTraining deserialize(byte[] payload, Map<String, String> options)
-                throws IOException {
-            return invokeRequiredStatic(
-                    VectorIndexTraining.class,
-                    "deserialize",
-                    new Class<?>[] {byte[].class},
-                    new Object[] {payload},
-                    VectorIndexTraining.class);
-        }
-
-        @Override
-        public VectorIndexWriter createCentroidShardWriter(
-                VectorIndexTraining training, int centroid, Map<String, String> options) {
-            try {
-                Constructor<VectorIndexWriter> constructor =
-                        VectorIndexWriter.class.getConstructor(VectorIndexTraining.class, int.class);
-                return constructor.newInstance(training, centroid);
-            } catch (NoSuchMethodException e) {
-                throw missingNativeApi("VectorIndexWriter(VectorIndexTraining, int)", e);
-            } catch (InstantiationException | IllegalAccessException e) {
-                throw new RuntimeException(
-                        "Failed to create native IVF_PQ centroid shard writer.", e);
-            } catch (InvocationTargetException e) {
-                throw rethrowInvocation(
-                        "Failed to create native IVF_PQ centroid shard writer.", e);
-            }
-        }
-
-        @Override
-        public void addIvfPqCentroidVectors(
-                VectorIndexWriter writer,
-                long[] ids,
-                float[] vectors,
-                int vectorCount,
-                Map<String, String> options) {
-            invokeRequired(
-                    writer,
-                    "addIvfPqCentroidVectors",
-                    new Class<?>[] {long[].class, float[].class, int.class},
-                    new Object[] {ids, vectors, vectorCount},
-                    Void.TYPE);
-        }
-
-        private static <T> T invokeRequired(
-                Object target,
-                String methodName,
-                Class<?>[] parameterTypes,
-                Object[] args,
-                Class<T> returnType) {
-            try {
-                Method method = target.getClass().getMethod(methodName, parameterTypes);
-                Object result = method.invoke(target, args);
-                if (returnType == Void.TYPE) {
-                    return null;
-                }
-                return returnType.cast(result);
-            } catch (NoSuchMethodException e) {
-                throw missingNativeApi(target.getClass().getSimpleName() + "." + methodName, e);
-            } catch (IllegalAccessException e) {
-                throw new RuntimeException("Failed to access native vector API: " + methodName, e);
-            } catch (InvocationTargetException e) {
-                throw rethrowInvocation("Native vector API failed: " + methodName, e);
-            }
-        }
-
-        private static <T> T invokeRequiredStatic(
-                Class<?> targetClass,
-                String methodName,
-                Class<?>[] parameterTypes,
-                Object[] args,
-                Class<T> returnType) {
-            try {
-                Method method = targetClass.getMethod(methodName, parameterTypes);
-                Object result = method.invoke(null, args);
-                return returnType.cast(result);
-            } catch (NoSuchMethodException e) {
-                throw missingNativeApi(targetClass.getSimpleName() + "." + methodName, e);
-            } catch (IllegalAccessException e) {
-                throw new RuntimeException("Failed to access native vector API: " + methodName, e);
-            } catch (InvocationTargetException e) {
-                throw rethrowInvocation("Native vector API failed: " + methodName, e);
-            }
-        }
-
-        private static UnsupportedOperationException missingNativeApi(
-                String api, NoSuchMethodException cause) {
-            return new UnsupportedOperationException(
-                    "Current paimon-vector-index Java binding does not support centroid IVF_PQ "
-                            + "sharding. Missing native API: "
-                            + api,
-                    cause);
-        }
-
-        private static RuntimeException rethrowInvocation(
-                String message, InvocationTargetException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof RuntimeException) {
-                return (RuntimeException) cause;
-            }
-            if (cause instanceof Error) {
-                throw (Error) cause;
-            }
-            return new RuntimeException(message, cause);
-        }
-    }
-
-    private static byte[] readFully(InputStream input) throws IOException {
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        byte[] buffer = new byte[4096];
-        int read;
-        while ((read = input.read(buffer)) >= 0) {
-            output.write(buffer, 0, read);
-        }
-        return output.toByteArray();
     }
 }

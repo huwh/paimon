@@ -27,7 +27,6 @@ import org.apache.paimon.globalindex.VectorGlobalIndexer;
 import org.apache.paimon.globalindex.io.GlobalIndexFileReader;
 import org.apache.paimon.globalindex.io.GlobalIndexFileWriter;
 import org.apache.paimon.types.DataType;
-import org.apache.paimon.utils.IOUtils;
 
 import java.io.IOException;
 import java.util.LinkedHashMap;
@@ -110,9 +109,7 @@ public class NativeVectorGlobalIndexer implements VectorGlobalIndexer {
     }
 
     private GlobalIndexReader createCentroidRoutedReader(
-            GlobalIndexFileReader fileReader,
-            CentroidRoutedFiles files,
-            ExecutorService executor) {
+            GlobalIndexFileReader fileReader, CentroidRoutedFiles files, ExecutorService executor) {
         try {
             return new NativeCentroidRoutedIndexReader(
                     fileReader,
@@ -137,8 +134,7 @@ public class NativeVectorGlobalIndexer implements VectorGlobalIndexer {
             return false;
         }
         try {
-            VectorIndexMeta meta = VectorIndexMeta.deserialize(indexMeta);
-            return meta.shardMode() == IvfPqShard.CENTROID_BASED;
+            return VectorIndexMeta.deserialize(indexMeta).shardMode() == IvfPqShard.CENTROID_BASED;
         } catch (IOException | IllegalArgumentException e) {
             return false;
         }
@@ -152,14 +148,21 @@ public class NativeVectorGlobalIndexer implements VectorGlobalIndexer {
             int limit,
             Map<String, String> options) {
         try {
-            byte[] fileBytes;
-            try (org.apache.paimon.fs.SeekableInputStream in =
-                    fileReader.getInputStream(globalIndexFile)) {
-                fileBytes = IOUtils.readFully(in, false);
+            VectorIndexMeta routingMeta = VectorIndexMeta.deserialize(globalIndexFile.metadata());
+            if (!routingMeta.hasModelIdentity()) {
+                return java.util.Collections.emptySet();
             }
-            VectorGlobalIndexFileMeta.deserialize(fileBytes);
             Set<Integer> routed = new LinkedHashSet<>();
-            try (VectorTrainingModel model = NativeVectorTrainingModels.load(fileBytes)) {
+            try (VectorTrainingModel model =
+                    NativeVectorTrainingModels.load(fileReader, globalIndexFile)) {
+                if (routingMeta.nlist() == null
+                        || routingMeta.nlist() != model.centroids().nlist()
+                        || routingMeta.modelDigest() == null
+                        || !routingMeta.modelDigest().equals(model.modelDigest())) {
+                    throw new IOException(
+                            "Routing manifest metadata does not match the vector model artifact: "
+                                    + globalIndexFile.filePath().getName());
+                }
                 int nprobe = nprobe(options, limit);
                 for (float[] queryVector : queryVectors) {
                     for (int centroid : model.centroids().nearestCentroids(queryVector, nprobe)) {
@@ -175,15 +178,44 @@ public class NativeVectorGlobalIndexer implements VectorGlobalIndexer {
 
     @Override
     public boolean acceptsRoutedIndexFile(byte[] indexMeta, Set<Integer> routedCentroids) {
+        return acceptsRoutedIndexFile(null, indexMeta, routedCentroids);
+    }
+
+    @Override
+    public boolean acceptsRoutedIndexFile(
+            byte[] routingIndexMeta, byte[] indexMeta, Set<Integer> routedCentroids) {
         if (indexMeta == null || routedCentroids.isEmpty()) {
             return false;
         }
         try {
             VectorIndexMeta meta = VectorIndexMeta.deserialize(indexMeta);
-            return meta.isCentroidShard()
-                    && meta.rowIdEncoding() == VectorIndexMeta.RowIdEncoding.ABSOLUTE_ROW_ID
-                    && meta.centroid() != null
-                    && routedCentroids.contains(meta.centroid());
+            if (!meta.isCentroidShard()
+                    || meta.rowIdEncoding() != VectorIndexMeta.RowIdEncoding.ABSOLUTE_ROW_ID
+                    || meta.centroid() == null) {
+                return false;
+            }
+            if (routingIndexMeta != null
+                    && !isCompatibleRoutedIndexFile(routingIndexMeta, indexMeta)) {
+                return false;
+            }
+            return meta.modelDigest() != null && routedCentroids.contains(meta.centroid());
+        } catch (IOException | IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    @Override
+    public boolean isCompatibleRoutedIndexFile(byte[] routingIndexMeta, byte[] indexMeta) {
+        if (routingIndexMeta == null || indexMeta == null) {
+            return false;
+        }
+        try {
+            VectorIndexMeta routingMeta = VectorIndexMeta.deserialize(routingIndexMeta);
+            VectorIndexMeta shardMeta = VectorIndexMeta.deserialize(indexMeta);
+            return routingMeta.shardMode() == IvfPqShard.CENTROID_BASED
+                    && routingMeta.modelDigest() != null
+                    && shardMeta.isCentroidShard()
+                    && routingMeta.modelDigest().equals(shardMeta.modelDigest());
         } catch (IOException | IllegalArgumentException e) {
             return false;
         }
@@ -255,10 +287,17 @@ public class NativeVectorGlobalIndexer implements VectorGlobalIndexer {
                     return null;
                 }
 
+                VectorIndexMeta routingMeta = parseVectorIndexMeta(globalIndexFile.metadata());
+                if (!routingMeta.hasModelIdentity()) {
+                    return null;
+                }
                 VectorGlobalIndexFileMeta globalMeta;
                 try (org.apache.paimon.fs.SeekableInputStream in =
                         fileReader.getInputStream(globalIndexFile)) {
-                    globalMeta = VectorGlobalIndexFileMeta.deserialize(IOUtils.readFully(in, false));
+                    globalMeta =
+                            VectorGlobalIndexFileMeta.readArtifactHeader(
+                                            in, globalIndexFile.fileSize())
+                                    .metadata();
                 }
                 if (globalMeta.shardMode() != IvfPqShard.CENTROID_BASED) {
                     throw new IllegalArgumentException(
@@ -266,10 +305,37 @@ public class NativeVectorGlobalIndexer implements VectorGlobalIndexer {
                                     + globalMeta.shardMode().optionValue()
                                     + ".");
                 }
-                Map<Integer, GlobalIndexIOMeta> centroidToFile = tryCreateCentroidDataShardFiles(files);
+                if (routingMeta.nlist() == null
+                        || routingMeta.nlist() != globalMeta.nlist()
+                        || routingMeta.modelDigest() == null
+                        || !routingMeta.modelDigest().equals(globalMeta.modelDigest())) {
+                    throw new IllegalArgumentException(
+                            "Routing manifest metadata does not match vector model artifact: "
+                                    + globalIndexFile.filePath().getName());
+                }
+                Map<Integer, GlobalIndexIOMeta> centroidToFile =
+                        tryCreateCentroidDataShardFiles(files);
+                for (Map.Entry<Integer, GlobalIndexIOMeta> shard : centroidToFile.entrySet()) {
+                    VectorIndexMeta shardMeta = parseVectorIndexMeta(shard.getValue().metadata());
+                    if (!globalMeta.modelDigest().equals(shardMeta.modelDigest())) {
+                        throw new IllegalArgumentException(
+                                "Centroid shard model digest does not match routing model: file="
+                                        + shard.getValue().filePath().getName()
+                                        + ", centroid="
+                                        + shard.getKey());
+                    }
+                    if (shard.getKey() < 0 || shard.getKey() >= globalMeta.nlist()) {
+                        throw new IllegalArgumentException(
+                                "Centroid shard id is outside routing model nlist: centroid="
+                                        + shard.getKey()
+                                        + ", nlist="
+                                        + globalMeta.nlist());
+                    }
+                }
                 for (GlobalIndexIOMeta file : files) {
                     String fileName = file.filePath().getName();
-                    if (file == globalIndexFile || file.filePath().equals(globalIndexFile.filePath())) {
+                    if (file == globalIndexFile
+                            || file.filePath().equals(globalIndexFile.filePath())) {
                         continue;
                     }
                     if (!containsFile(centroidToFile, file)) {
@@ -288,6 +354,8 @@ public class NativeVectorGlobalIndexer implements VectorGlobalIndexer {
         static Map<Integer, GlobalIndexIOMeta> tryCreateCentroidDataShardFiles(
                 List<GlobalIndexIOMeta> files) throws IOException {
             Map<Integer, GlobalIndexIOMeta> centroidToFile = new LinkedHashMap<>();
+            String modelDigest = null;
+            Boolean identifiedMetadata = null;
             for (GlobalIndexIOMeta file : files) {
                 if (file.fileKind() == IndexFileKind.ROUTING_MODEL) {
                     continue;
@@ -297,6 +365,21 @@ public class NativeVectorGlobalIndexer implements VectorGlobalIndexer {
                         parseCentroidShardMeta(fileMeta, file.filePath().getName());
                 if (shardMeta == null) {
                     continue;
+                }
+                boolean identified = shardMeta.modelDigest() != null;
+                if (identifiedMetadata == null) {
+                    identifiedMetadata = identified;
+                } else if (identifiedMetadata != identified) {
+                    throw new IllegalArgumentException(
+                            "Centroid data shards mix legacy and identified models: file="
+                                    + file.filePath().getName());
+                }
+                if (identified && modelDigest == null) {
+                    modelDigest = shardMeta.modelDigest();
+                } else if (identified && !modelDigest.equals(shardMeta.modelDigest())) {
+                    throw new IllegalArgumentException(
+                            "Centroid data shards use different model digests: file="
+                                    + file.filePath().getName());
                 }
                 GlobalIndexIOMeta previous = centroidToFile.put(shardMeta.centroid(), file);
                 if (previous != null) {
@@ -317,7 +400,8 @@ public class NativeVectorGlobalIndexer implements VectorGlobalIndexer {
             return false;
         }
 
-        private static VectorIndexMeta parseCentroidShardMeta(VectorIndexMeta meta, String fileName) {
+        private static VectorIndexMeta parseCentroidShardMeta(
+                VectorIndexMeta meta, String fileName) {
             if (meta == null) {
                 return null;
             }

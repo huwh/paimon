@@ -68,6 +68,8 @@ public class NativeVectorGlobalIndexTest {
 
     private static final String IVF_PQ_IDENTIFIER =
             IvfPqAlgorithmVectorGlobalIndexerFactory.IDENTIFIER;
+    private static final String MODEL_DIGEST =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
     private FileIO fileIO;
     private Path indexPath;
     private DataType vectorType;
@@ -250,18 +252,62 @@ public class NativeVectorGlobalIndexTest {
                                                         new Path(indexPath, "global-index-1"),
                                                         0L,
                                                         VectorIndexMeta.routingModel(
-                                                                        IvfPqShard.CENTROID_BASED)
+                                                                        IvfPqShard.CENTROID_BASED,
+                                                                        2,
+                                                                        MODEL_DIGEST)
                                                                 .serialize(),
                                                         IndexFileKind.ROUTING_MODEL),
                                                 new GlobalIndexIOMeta(
                                                         new Path(indexPath, "global-index-2"),
                                                         0L,
                                                         VectorIndexMeta.routingModel(
-                                                                        IvfPqShard.CENTROID_BASED)
+                                                                        IvfPqShard.CENTROID_BASED,
+                                                                        2,
+                                                                        MODEL_DIGEST)
                                                                 .serialize(),
                                                         IndexFileKind.ROUTING_MODEL))))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("only one global index file per partition");
+    }
+
+    @Test
+    public void testCentroidRoutingSkipsLegacyModelWithoutIdentity() throws IOException {
+        GlobalIndexIOMeta legacyRoutingModel =
+                new GlobalIndexIOMeta(
+                        new Path(indexPath, "legacy-global-index"),
+                        0L,
+                        "{\"shardMode\":\"centroid-based\"}".getBytes(StandardCharsets.UTF_8),
+                        IndexFileKind.ROUTING_MODEL);
+
+        assertThat(
+                        NativeVectorGlobalIndexer.CentroidRoutedFiles.tryCreate(
+                                null, Collections.singletonList(legacyRoutingModel)))
+                .isNull();
+    }
+
+    @Test
+    public void testCentroidDataShardsRejectMixedModelDigests() throws IOException {
+        GlobalIndexIOMeta first =
+                new GlobalIndexIOMeta(
+                        new Path(indexPath, "centroid-0"),
+                        0L,
+                        VectorIndexMeta.centroidShard(0, MODEL_DIGEST).serialize());
+        GlobalIndexIOMeta second =
+                new GlobalIndexIOMeta(
+                        new Path(indexPath, "centroid-1"),
+                        0L,
+                        VectorIndexMeta.centroidShard(
+                                        1,
+                                        "sha256:1111111111111111111111111111111111111111111111111111111111111111")
+                                .serialize());
+
+        assertThatThrownBy(
+                        () ->
+                                NativeVectorGlobalIndexer.CentroidRoutedFiles
+                                        .tryCreateCentroidDataShardFiles(
+                                                java.util.Arrays.asList(first, second)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("different model digests");
     }
 
     @Test

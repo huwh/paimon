@@ -161,9 +161,12 @@ public class DataEvolutionVectorScan implements VectorScan {
                 indexFileRouter.tryRouteIndexFiles(
                         snapshot, indexFileHandler, searchableIndexFileEntries);
         if (routedIndexFiles != null) {
-            return buildPlan(snapshot, routedIndexFiles, searchableIndexFiles, RawFallback.SKIPPED);
+            return buildPlan(
+                    snapshot,
+                    routedIndexFiles,
+                    routedIndexFiles.isEmpty() ? routedIndexFiles : searchableIndexFiles);
         }
-        return buildPlan(snapshot, searchableIndexFiles, searchableIndexFiles, RawFallback.ENABLED);
+        return buildPlan(snapshot, searchableIndexFiles, searchableIndexFiles);
     }
 
     @Nullable
@@ -212,8 +215,7 @@ public class DataEvolutionVectorScan implements VectorScan {
     private Plan buildPlan(
             @Nullable Snapshot snapshot,
             List<IndexFileMeta> vectorAndScalarCandidates,
-            List<IndexFileMeta> scalarCandidates,
-            RawFallback rawFallback) {
+            List<IndexFileMeta> allSearchableCandidates) {
         String vectorIndexType = vectorIndexType(vectorAndScalarCandidates);
         if (vectorIndexType == null) {
             vectorIndexType = configuredVectorIndexType();
@@ -226,13 +228,11 @@ public class DataEvolutionVectorScan implements VectorScan {
         // is produced here and the search falls back to a brute-force RawVectorSearchSplit (correct
         // results, but the ANN index is bypassed).
         Map<Range, List<IndexFileMeta>> vectorByRange = new HashMap<>();
-        List<IndexFileMeta> vectorIndexFiles = new ArrayList<>();
         for (IndexFileMeta indexFile : vectorAndScalarCandidates) {
             GlobalIndexMeta meta = checkNotNull(indexFile.globalIndexMeta());
             if (isPrimaryColumn(meta, vectorColumn.id())) {
                 Range range = new Range(meta.rowRangeStart(), meta.rowRangeEnd());
                 vectorByRange.computeIfAbsent(range, k -> new ArrayList<>()).add(indexFile);
-                vectorIndexFiles.add(indexFile);
             }
         }
 
@@ -242,7 +242,7 @@ public class DataEvolutionVectorScan implements VectorScan {
             Range range = entry.getKey();
             List<IndexFileMeta> vectorFiles = entry.getValue();
             List<IndexFileMeta> scalarFiles =
-                    scalarCandidates.stream()
+                    allSearchableCandidates.stream()
                             .filter(
                                     f -> {
                                         GlobalIndexMeta globalIndex =
@@ -258,16 +258,20 @@ public class DataEvolutionVectorScan implements VectorScan {
 
         CoreOptions effectiveOptions = effectiveCoreOptions();
         GlobalIndexSearchMode vectorSearchMode = effectiveOptions.vectorIndexSearchMode();
-        if (rawFallback == RawFallback.SKIPPED) {
-            return plan(snapshot, splits);
-        }
-
+        List<IndexFileMeta> coverageVectorIndexFiles =
+                allSearchableCandidates.stream()
+                        .filter(
+                                indexFile ->
+                                        isPrimaryColumn(
+                                                checkNotNull(indexFile.globalIndexMeta()),
+                                                vectorColumn.id()))
+                        .collect(Collectors.toList());
         List<Range> rawRowRanges =
                 new DataEvolutionGlobalIndexCoverage(
                                 table,
                                 snapshot,
                                 partitionFilter,
-                                vectorIndexFiles,
+                                coverageVectorIndexFiles,
                                 vectorSearchMode)
                         .unindexedRanges(vectorColumn.id());
         if (filter != null) {
@@ -276,7 +280,7 @@ public class DataEvolutionVectorScan implements VectorScan {
                                     table,
                                     snapshot,
                                     partitionFilter,
-                                    scalarIndexFiles(scalarCandidates),
+                                    scalarIndexFiles(allSearchableCandidates),
                                     effectiveOptions.scalarIndexSearchMode())
                             .unindexedRanges(table.rowType(), filter);
             if (vectorSearchMode == GlobalIndexSearchMode.FAST) {
@@ -293,16 +297,11 @@ public class DataEvolutionVectorScan implements VectorScan {
             splits.add(
                     new RawVectorSearchSplit(
                             rawRowRanges,
-                            scalarIndexFiles(scalarCandidates, rawRowRanges),
+                            scalarIndexFiles(allSearchableCandidates, rawRowRanges),
                             vectorIndexType));
         }
 
         return plan(snapshot, splits);
-    }
-
-    private enum RawFallback {
-        ENABLED,
-        SKIPPED
     }
 
     private Plan plan(@Nullable Snapshot snapshot, List<VectorSearchSplit> splits) {

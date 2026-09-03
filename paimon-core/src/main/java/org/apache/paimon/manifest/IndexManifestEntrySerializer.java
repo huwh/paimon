@@ -28,7 +28,11 @@ import org.apache.paimon.index.IndexFileMeta;
 import org.apache.paimon.utils.ObjectSerializer;
 import org.apache.paimon.utils.OffsetRow;
 
-import java.nio.charset.StandardCharsets;
+import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.JsonNode;
+import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.node.ObjectNode;
+
+import java.io.IOException;
 import java.util.function.Function;
 
 import static org.apache.paimon.data.BinaryString.fromString;
@@ -46,6 +50,9 @@ public class IndexManifestEntrySerializer extends ObjectSerializer<IndexManifest
      * <p>Do not change when adding nullable fields. Old manifest readers skip unknown fields.
      */
     private static final int FORMAT_IDENTIFIER = 1;
+
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final String LEGACY_FILE_KIND = "fileKind";
 
     public IndexManifestEntrySerializer() {
         super(IndexManifestEntry.MANIFEST_ROW_TYPE);
@@ -140,48 +147,36 @@ public class IndexManifestEntrySerializer extends ObjectSerializer<IndexManifest
                         indexFileKind));
     }
 
-    private static int globalIndexFieldCount(int version) {
-        if (version == 1) {
-            return 5;
-        }
-        if (version == 2) {
-            return 6;
-        }
-        if (version == 3 || version == 4) {
-            return 8;
-        }
-        return 6;
-    }
-
-    private static byte[] routingModelIndexMeta(String shardMode) {
-        String effectiveShardMode =
-                shardMode == null || shardMode.isEmpty() ? "centroid-based" : shardMode;
-        return ("{\"shardMode\":\"" + effectiveShardMode + "\"}").getBytes(StandardCharsets.UTF_8);
-    }
-
     private static boolean isLegacyRoutingModelIndexMeta(byte[] indexMeta) {
         if (indexMeta == null) {
             return false;
         }
-        String meta = new String(indexMeta, StandardCharsets.UTF_8);
-        return meta.contains("\"fileKind\":\"ROUTING_MODEL\"")
-                || meta.contains("\"fileKind\" : \"ROUTING_MODEL\"");
+        try {
+            return IndexFileKind.ROUTING_MODEL
+                    .name()
+                    .equals(objectNode(indexMeta).path(LEGACY_FILE_KIND).asText());
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     private static byte[] stripLegacyFileKind(byte[] indexMeta) {
-        String meta = new String(indexMeta, StandardCharsets.UTF_8);
-        String shardMode = null;
-        String key = "\"shardMode\"";
-        int keyPos = meta.indexOf(key);
-        if (keyPos >= 0) {
-            int colon = meta.indexOf(':', keyPos + key.length());
-            int firstQuote = colon < 0 ? -1 : meta.indexOf('"', colon + 1);
-            int secondQuote = firstQuote < 0 ? -1 : meta.indexOf('"', firstQuote + 1);
-            if (secondQuote > firstQuote) {
-                shardMode = meta.substring(firstQuote + 1, secondQuote);
-            }
+        try {
+            ObjectNode root = objectNode(indexMeta);
+            root.remove(LEGACY_FILE_KIND);
+            return OBJECT_MAPPER.writeValueAsBytes(root);
+        } catch (IOException e) {
+            throw new IllegalArgumentException(
+                    "Failed to migrate legacy routing model metadata.", e);
         }
-        return routingModelIndexMeta(shardMode);
+    }
+
+    private static ObjectNode objectNode(byte[] indexMeta) throws IOException {
+        JsonNode root = OBJECT_MAPPER.readTree(indexMeta);
+        if (root == null || !root.isObject()) {
+            throw new IOException("Vector index metadata must be a JSON object.");
+        }
+        return (ObjectNode) root;
     }
 
     public static Function<InternalRow, BinaryRow> partitionGetter() {

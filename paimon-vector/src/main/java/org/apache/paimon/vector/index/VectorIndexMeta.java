@@ -43,6 +43,8 @@ public class VectorIndexMeta implements Serializable {
     private static final String CENTROID = "centroid";
     private static final String LEGACY_CENTROID_ID = "centroidId";
     private static final String ROW_ID_ENCODING = "rowIdEncoding";
+    private static final String NLIST = "nlist";
+    private static final String MODEL_DIGEST = "modelDigest";
 
     public enum RowIdEncoding {
         ABSOLUTE_ROW_ID
@@ -51,35 +53,67 @@ public class VectorIndexMeta implements Serializable {
     private final IvfPqShard shardMode;
     private final Integer centroid;
     private final RowIdEncoding rowIdEncoding;
+    private final Integer nlist;
+    private final String modelDigest;
 
     VectorIndexMeta() {
-        this(null, null, null);
+        this(null, null, null, null, null);
     }
 
     private VectorIndexMeta(
             IvfPqShard shardMode,
             Integer centroid,
-            RowIdEncoding rowIdEncoding) {
+            RowIdEncoding rowIdEncoding,
+            Integer nlist,
+            String modelDigest) {
         this.shardMode = shardMode;
         this.centroid = centroid;
         this.rowIdEncoding = rowIdEncoding;
+        this.nlist = nlist;
+        this.modelDigest = modelDigest;
+        validate();
     }
 
+    /** Creates legacy centroid metadata without a model identity. */
     public static VectorIndexMeta centroidShard(int centroid) {
         if (centroid < 0) {
             throw new IllegalArgumentException("centroid must not be negative: " + centroid);
         }
         return new VectorIndexMeta(
-                IvfPqShard.CENTROID_BASED,
-                centroid,
-                RowIdEncoding.ABSOLUTE_ROW_ID);
+                IvfPqShard.CENTROID_BASED, centroid, RowIdEncoding.ABSOLUTE_ROW_ID, null, null);
     }
 
+    public static VectorIndexMeta centroidShard(int centroid, String modelDigest) {
+        if (centroid < 0) {
+            throw new IllegalArgumentException("centroid must not be negative: " + centroid);
+        }
+        VectorModelDigest.validate(modelDigest);
+        return new VectorIndexMeta(
+                IvfPqShard.CENTROID_BASED,
+                centroid,
+                RowIdEncoding.ABSOLUTE_ROW_ID,
+                null,
+                modelDigest);
+    }
+
+    /** Creates legacy routing metadata without a model identity. */
     public static VectorIndexMeta routingModel(IvfPqShard shardMode) {
         if (shardMode == null) {
             throw new IllegalArgumentException("Routing model requires shardMode.");
         }
-        return new VectorIndexMeta(shardMode, null, null);
+        return new VectorIndexMeta(shardMode, null, null, null, null);
+    }
+
+    public static VectorIndexMeta routingModel(
+            IvfPqShard shardMode, int nlist, String modelDigest) {
+        if (shardMode == null) {
+            throw new IllegalArgumentException("Routing model requires shardMode.");
+        }
+        if (nlist <= 0) {
+            throw new IllegalArgumentException("Routing model requires positive nlist: " + nlist);
+        }
+        VectorModelDigest.validate(modelDigest);
+        return new VectorIndexMeta(shardMode, null, null, nlist, modelDigest);
     }
 
     public byte[] serialize() throws IOException {
@@ -92,6 +126,12 @@ public class VectorIndexMeta implements Serializable {
         }
         if (rowIdEncoding != null) {
             map.put(ROW_ID_ENCODING, rowIdEncoding.name());
+        }
+        if (nlist != null) {
+            map.put(NLIST, String.valueOf(nlist));
+        }
+        if (modelDigest != null) {
+            map.put(MODEL_DIGEST, modelDigest);
         }
         return OBJECT_MAPPER.writeValueAsBytes(map);
     }
@@ -107,10 +147,14 @@ public class VectorIndexMeta implements Serializable {
             centroid = map.get(LEGACY_CENTROID_ID);
         }
         String rowIdEncoding = map.get(ROW_ID_ENCODING);
+        String nlist = map.get(NLIST);
+        String modelDigest = map.get(MODEL_DIGEST);
         return new VectorIndexMeta(
                 IvfPqShard.fromValue(shardMode),
                 centroid == null ? null : Integer.valueOf(centroid),
-                rowIdEncoding == null ? null : RowIdEncoding.valueOf(rowIdEncoding));
+                rowIdEncoding == null ? null : RowIdEncoding.valueOf(rowIdEncoding),
+                nlist == null ? null : Integer.valueOf(nlist),
+                modelDigest);
     }
 
     public boolean isCentroidShard() {
@@ -127,5 +171,45 @@ public class VectorIndexMeta implements Serializable {
 
     public RowIdEncoding rowIdEncoding() {
         return rowIdEncoding;
+    }
+
+    public Integer nlist() {
+        return nlist;
+    }
+
+    public String modelDigest() {
+        return modelDigest;
+    }
+
+    public boolean hasModelIdentity() {
+        return nlist != null || modelDigest != null;
+    }
+
+    private void validate() {
+        if (shardMode == null) {
+            if (centroid != null || rowIdEncoding != null || nlist != null || modelDigest != null) {
+                throw new IllegalArgumentException(
+                        "Vector index metadata without shardMode cannot contain routing fields.");
+            }
+            return;
+        }
+        if (nlist == null && modelDigest == null) {
+            // Metadata written before model identities were introduced. It is readable for the
+            // unpruned fallback, but is never eligible for routing.
+            return;
+        }
+        VectorModelDigest.validate(modelDigest);
+        if (centroid != null) {
+            if (centroid < 0) {
+                throw new IllegalArgumentException("centroid must not be negative: " + centroid);
+            }
+            if (rowIdEncoding != RowIdEncoding.ABSOLUTE_ROW_ID || nlist != null) {
+                throw new IllegalArgumentException(
+                        "Centroid shard metadata requires ABSOLUTE_ROW_ID and no nlist.");
+            }
+        } else if (rowIdEncoding != null || nlist == null || nlist <= 0) {
+            throw new IllegalArgumentException(
+                    "Routing model metadata requires positive nlist and no rowIdEncoding.");
+        }
     }
 }

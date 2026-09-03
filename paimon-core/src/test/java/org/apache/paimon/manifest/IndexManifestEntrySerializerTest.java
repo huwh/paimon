@@ -29,9 +29,8 @@ import org.apache.paimon.utils.ObjectSerializerTestBase;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
-import java.util.Random;
-
 import java.nio.charset.StandardCharsets;
+import java.util.Random;
 
 import static org.apache.paimon.index.IndexFileMetaSerializerTest.randomIndexFile;
 import static org.apache.paimon.io.DataFileTestUtils.row;
@@ -144,14 +143,15 @@ public class IndexManifestEntrySerializerTest extends ObjectSerializerTestBase<I
                                         9,
                                         7,
                                         null,
-                                        "{\"fileKind\":\"ROUTING_MODEL\",\"shardMode\":\"centroid-based\"}"
+                                        "{\"fileKind\":\"ROUTING_MODEL\",\"shardMode\":\"centroid-based\",\"nlist\":8,\"modelDigest\":\"sha256:abc\",\"futureField\":{\"nested\":true}}"
                                                 .getBytes(StandardCharsets.UTF_8)),
                                 null));
         IndexFileMeta restored = serializer.fromRow(serializer.toRow(entry)).indexFile();
 
         assertThat(restored.fileKind()).isEqualTo(IndexFileKind.ROUTING_MODEL);
         assertThat(new String(restored.globalIndexMeta().indexMeta(), StandardCharsets.UTF_8))
-                .isEqualTo("{\"shardMode\":\"centroid-based\"}");
+                .isEqualTo(
+                        "{\"shardMode\":\"centroid-based\",\"nlist\":8,\"modelDigest\":\"sha256:abc\",\"futureField\":{\"nested\":true}}");
     }
 
     @Override

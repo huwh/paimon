@@ -42,7 +42,8 @@ import java.util.Map;
 /** Writes one physical vector index file for one centroid. */
 public class NativeCentroidShardIndexWriter implements GlobalIndexSingleColumnWriter, Closeable {
 
-    private static final String FILE_NAME_PREFIX = "vector:centroid";
+    // ':' is parsed as a URI scheme separator by Path and is not valid in a relative file name.
+    private static final String FILE_NAME_PREFIX = "vector-centroid";
     private static final int IO_BUFFER_SIZE = 8 * 1024 * 1024;
     private static final int ADD_BATCH_SIZE = 10000;
 
@@ -69,7 +70,8 @@ public class NativeCentroidShardIndexWriter implements GlobalIndexSingleColumnWr
         this.trainingModel = trainingModel;
         this.centroid = centroid;
         this.dim = parseDimension(nativeOptions);
-        this.recordSizeInBytes = NativeVectorGlobalIndexWriter.checkedRecordSize(dim, IO_BUFFER_SIZE);
+        this.recordSizeInBytes =
+                NativeVectorGlobalIndexWriter.checkedRecordSize(dim, IO_BUFFER_SIZE);
         try {
             this.tempVectorFile = File.createTempFile("paimon-vector-centroid-shard-", ".bin");
             this.tempVectorFile.deleteOnExit();
@@ -106,6 +108,7 @@ public class NativeCentroidShardIndexWriter implements GlobalIndexSingleColumnWr
     public List<ResultEntry> finish() {
         ensureNotFinished();
         finished = true;
+        Throwable failure = null;
         try {
             if (count == 0) {
                 return Collections.emptyList();
@@ -114,7 +117,8 @@ public class NativeCentroidShardIndexWriter implements GlobalIndexSingleColumnWr
             closeWriteChannel();
 
             String fileName = fileWriter.newFileName(FILE_NAME_PREFIX + "-" + centroid);
-            try (VectorIndexWriter writer = trainingModel.createIvfPqCentroidShardWriter(centroid)) {
+            try (VectorIndexWriter writer =
+                    trainingModel.createIvfPqCentroidShardWriter(centroid)) {
                 addVectorsFromTempFile(writer);
                 try (PositionOutputStream out = fileWriter.newOutputStream(fileName)) {
                     writer.writeIndex(out);
@@ -125,23 +129,41 @@ public class NativeCentroidShardIndexWriter implements GlobalIndexSingleColumnWr
                     new ResultEntry(
                             fileName,
                             count,
-                            VectorIndexMeta.centroidShard(centroid).serialize(),
+                            VectorIndexMeta.centroidShard(centroid, trainingModel.modelDigest())
+                                    .serialize(),
                             new Range(minRowId, maxRowId)));
         } catch (IOException e) {
-            throw new RuntimeException(
-                    "Failed to write native centroid shard index for centroid=" + centroid, e);
+            RuntimeException wrapped =
+                    new RuntimeException(
+                            "Failed to write native centroid shard index for centroid=" + centroid,
+                            e);
+            failure = wrapped;
+            throw wrapped;
+        } catch (RuntimeException | Error e) {
+            failure = e;
+            throw e;
         } finally {
-            close();
+            try {
+                close();
+            } catch (RuntimeException closeFailure) {
+                if (failure == null) {
+                    throw closeFailure;
+                }
+                failure.addSuppressed(closeFailure);
+            }
         }
     }
 
     @Override
     public void close() {
-        closeWriteChannel();
-        writeBuf = null;
-        if (tempVectorFile != null) {
-            tempVectorFile.delete();
-            tempVectorFile = null;
+        try {
+            closeWriteChannel();
+        } finally {
+            writeBuf = null;
+            if (tempVectorFile != null) {
+                tempVectorFile.delete();
+                tempVectorFile = null;
+            }
         }
     }
 
@@ -153,8 +175,7 @@ public class NativeCentroidShardIndexWriter implements GlobalIndexSingleColumnWr
             }
             writeBuf.clear();
         } catch (IOException e) {
-            throw new RuntimeException(
-                    "Failed to flush centroid shard vector buffer to disk", e);
+            throw new RuntimeException("Failed to flush centroid shard vector buffer to disk", e);
         }
     }
 

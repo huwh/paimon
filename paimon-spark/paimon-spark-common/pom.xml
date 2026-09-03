@@ -93,6 +93,8 @@ under the License.
                             <artifactSet>
                                 <includes combine.children="append">
                                     <include>org.apache.paimon:paimon-bundle</include>
+                                    <include>org.apache.paimon:paimon-vector</include>
+                                    <include>org.apache.paimon:paimon-vector-index-java</include>
                                 </includes>
                             </artifactSet>
                         </configuration>

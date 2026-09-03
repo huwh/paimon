@@ -29,6 +29,7 @@ import org.apache.paimon.manifest.IndexManifestEntry;
 import org.apache.paimon.manifest.ManifestEntry;
 import org.apache.paimon.partition.PartitionPredicate;
 import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.types.DataField;
@@ -52,12 +53,17 @@ class CentroidShardedIvfPqIndexBuildPlanner {
     private final List<DataField> indexFields;
     private final List<Range> rowRangesToBuild;
     private final List<IndexedSplit> splits;
+    @Nullable private final BinaryRow partition;
 
     private CentroidShardedIvfPqIndexBuildPlanner(
-            List<DataField> indexFields, List<Range> rowRangesToBuild, List<IndexedSplit> splits) {
+            List<DataField> indexFields,
+            List<Range> rowRangesToBuild,
+            List<IndexedSplit> splits,
+            @Nullable BinaryRow partition) {
         this.indexFields = indexFields;
         this.rowRangesToBuild = rowRangesToBuild;
         this.splits = splits;
+        this.partition = partition;
     }
 
     static CentroidShardedIvfPqIndexBuildPlanner create(
@@ -66,6 +72,8 @@ class CentroidShardedIvfPqIndexBuildPlanner {
             String indexType,
             DataField indexField,
             @Nullable PartitionPredicate partitionPredicate) {
+        validateBucketMode(table.bucketMode(), table.name());
+        validatePartitionSelection(table, partitionPredicate);
         List<ManifestEntry> entries =
                 table.store()
                         .newScan()
@@ -95,13 +103,15 @@ class CentroidShardedIvfPqIndexBuildPlanner {
                         table, snapshot, indexType, indexFields, partitionPredicate);
         if (rowRangesToBuild.isEmpty()) {
             return new CentroidShardedIvfPqIndexBuildPlanner(
-                    indexFields, rowRangesToBuild, Collections.emptyList());
+                    indexFields, rowRangesToBuild, Collections.emptyList(), null);
         }
         validateFullRebuild(snapshot, rowRangesToBuild);
+        validateSelectedPartitionCoverage(snapshot, entries);
 
         List<IndexedSplit> splits = createPartitionIndexedSplits(table, entries, rowRangesToBuild);
-        validateSinglePartition(splits);
-        return new CentroidShardedIvfPqIndexBuildPlanner(indexFields, rowRangesToBuild, splits);
+        BinaryRow partition = validateSinglePartition(splits);
+        return new CentroidShardedIvfPqIndexBuildPlanner(
+                indexFields, rowRangesToBuild, splits, partition);
     }
 
     List<DataField> indexFields() {
@@ -116,8 +126,36 @@ class CentroidShardedIvfPqIndexBuildPlanner {
         return splits;
     }
 
+    BinaryRow partition() {
+        if (partition == null) {
+            throw new IllegalStateException("An empty centroid index build has no partition.");
+        }
+        return partition;
+    }
+
     boolean isEmpty() {
         return splits.isEmpty();
+    }
+
+    static void validateBucketMode(BucketMode bucketMode, String tableName) {
+        checkArgument(
+                bucketMode == BucketMode.BUCKET_UNAWARE,
+                "The centroid-sharded implementation of '%s=%s' currently supports only "
+                        + "bucket-unaware tables, but table '%s' uses bucket mode '%s'.",
+                IVF_PQ_SHARD_OPTION,
+                IvfPqShard.CENTROID_BASED.optionValue(),
+                tableName,
+                bucketMode);
+    }
+
+    private static void validatePartitionSelection(
+            FileStoreTable table, @Nullable PartitionPredicate partitionPredicate) {
+        checkArgument(
+                table.partitionKeys().isEmpty() || partitionPredicate != null,
+                "The centroid-sharded implementation of '%s=%s' requires an explicit "
+                        + "partition selection when building a partitioned table.",
+                IVF_PQ_SHARD_OPTION,
+                IvfPqShard.CENTROID_BASED.optionValue());
     }
 
     private static void validateNoExistingIndexFiles(
@@ -174,7 +212,37 @@ class CentroidShardedIvfPqIndexBuildPlanner {
                 fullRangeEnd);
     }
 
-    private static void validateSinglePartition(List<IndexedSplit> splits) {
+    private static void validateSelectedPartitionCoverage(
+            Snapshot snapshot, List<ManifestEntry> entries) {
+        List<Range> selectedRanges =
+                entries.stream()
+                        .map(ManifestEntry::file)
+                        .filter(file -> file.firstRowId() != null)
+                        .map(DataFileMeta::nonNullRowIdRange)
+                        .collect(Collectors.toList());
+        validateSelectedPartitionCoverage(snapshot.nextRowId(), selectedRanges);
+    }
+
+    static void validateSelectedPartitionCoverage(
+            @Nullable Long nextRowId, List<Range> selectedRanges) {
+        List<Range> merged = Range.sortAndMergeOverlap(selectedRanges, true);
+        long expectedEnd = nextRowId == null ? -1 : nextRowId - 1;
+        checkArgument(
+                expectedEnd >= 0
+                        && merged.size() == 1
+                        && merged.get(0).from == 0
+                        && merged.get(0).to == expectedEnd,
+                "The centroid-sharded implementation of '%s=%s' currently requires the "
+                        + "selected partition to own the complete table row-id range [0, %s]. "
+                        + "Selected partition coverage: %s.",
+                IVF_PQ_SHARD_OPTION,
+                IvfPqShard.CENTROID_BASED.optionValue(),
+                expectedEnd,
+                merged);
+    }
+
+    @Nullable
+    private static BinaryRow validateSinglePartition(List<IndexedSplit> splits) {
         BinaryRow partition = null;
         for (IndexedSplit split : splits) {
             if (partition == null) {
@@ -188,6 +256,7 @@ class CentroidShardedIvfPqIndexBuildPlanner {
                         IvfPqShard.CENTROID_BASED.optionValue());
             }
         }
+        return partition;
     }
 
     private static List<IndexedSplit> createPartitionIndexedSplits(
@@ -215,7 +284,9 @@ class CentroidShardedIvfPqIndexBuildPlanner {
                     continue;
                 }
                 List<DataFileMeta> dataFiles =
-                        bucketEntries.stream().map(ManifestEntry::file).collect(Collectors.toList());
+                        bucketEntries.stream()
+                                .map(ManifestEntry::file)
+                                .collect(Collectors.toList());
                 DataSplit dataSplit =
                         DataSplit.builder()
                                 .withPartition(partition)

@@ -21,6 +21,7 @@ package org.apache.paimon.vector.index;
 import org.apache.paimon.globalindex.GlobalIndexSingleColumnWriter;
 import org.apache.paimon.globalindex.io.GlobalIndexFileWriter;
 
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -31,11 +32,20 @@ public interface VectorTrainingModel extends Closeable {
 
     VectorCentroidModel centroids();
 
+    /**
+     * Stable SHA-256 identity of the serialized native model payload.
+     *
+     * <p>All routing and centroid shard files produced from one model must carry this digest.
+     */
+    default String modelDigest() throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        serializeNativeModelPayloadTo(out);
+        return VectorModelDigest.sha256(out.toByteArray());
+    }
+
     /** Creates a physical index writer for vectors assigned to one centroid shard. */
     GlobalIndexSingleColumnWriter createCentroidShardIndexWriter(
-            GlobalIndexFileWriter fileWriter,
-            int centroid,
-            Map<String, String> options);
+            GlobalIndexFileWriter fileWriter, int centroid, Map<String, String> options);
 
     /** Serializes the native global training model payload for persisted query-side routing. */
     void serializeNativeModelPayloadTo(OutputStream out) throws IOException;

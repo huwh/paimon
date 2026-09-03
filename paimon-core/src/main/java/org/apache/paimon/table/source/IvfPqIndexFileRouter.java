@@ -36,8 +36,10 @@ import org.apache.paimon.types.DataField;
 import javax.annotation.Nullable;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -105,28 +107,35 @@ class IvfPqIndexFileRouter {
             return null;
         }
 
-        Map<BinaryRow, Set<Integer>> routedCentroidsByPartition = new HashMap<>();
         Map<BinaryRow, List<GlobalIndexIOMeta>> globalIndexFilesByPartition =
                 routingGlobalIndexFilesByPartition(snapshot, indexFileHandler, pathFactory);
         if (globalIndexFilesByPartition.isEmpty()) {
             return null;
         }
+        Map<BinaryRow, Map<GlobalIndexIOMeta, Set<Integer>>> routesByPartition = new HashMap<>();
         for (BinaryRow partition : candidateVectorPartitions) {
             List<GlobalIndexIOMeta> globalIndexFiles = globalIndexFilesByPartition.get(partition);
             if (globalIndexFiles == null || globalIndexFiles.isEmpty()) {
                 return null;
             }
+            if (globalIndexFiles.size() != 1) {
+                return Collections.emptyList();
+            }
             for (GlobalIndexIOMeta globalIndexFile : globalIndexFiles) {
-                routedCentroidsByPartition
-                        .computeIfAbsent(partition, k -> new HashSet<>())
-                        .addAll(
-                                checkNotNull(vectorGlobalIndexer)
-                                        .routeCentroids(
-                                                fileReader,
-                                                globalIndexFile,
-                                                checkNotNull(queryVectors),
-                                                limit,
-                                                options));
+                Set<Integer> routedCentroids =
+                        checkNotNull(vectorGlobalIndexer)
+                                .routeCentroids(
+                                        fileReader,
+                                        globalIndexFile,
+                                        checkNotNull(queryVectors),
+                                        limit,
+                                        options);
+                if (routedCentroids.isEmpty()) {
+                    return null;
+                }
+                routesByPartition
+                        .computeIfAbsent(partition, k -> new LinkedHashMap<>())
+                        .put(globalIndexFile, routedCentroids);
             }
         }
 
@@ -136,13 +145,25 @@ class IvfPqIndexFileRouter {
             if (!isPrimaryColumn(globalIndex, vectorColumn.id())) {
                 continue;
             }
-            Set<Integer> routedCentroids = routedCentroidsByPartition.get(entry.partition());
-            if (routedCentroids == null) {
+            Map<GlobalIndexIOMeta, Set<Integer>> routes = routesByPartition.get(entry.partition());
+            if (routes == null) {
                 continue;
             }
-            if (checkNotNull(vectorGlobalIndexer)
-                    .acceptsRoutedIndexFile(globalIndex.indexMeta(), routedCentroids)) {
-                routedIndexFiles.add(entry.indexFile());
+            for (Map.Entry<GlobalIndexIOMeta, Set<Integer>> route : routes.entrySet()) {
+                if (!checkNotNull(vectorGlobalIndexer)
+                        .isCompatibleRoutedIndexFile(
+                                route.getKey().metadata(), globalIndex.indexMeta())) {
+                    // Never treat an incompatible model generation as covered by this route.
+                    return Collections.emptyList();
+                }
+                if (checkNotNull(vectorGlobalIndexer)
+                        .acceptsRoutedIndexFile(
+                                route.getKey().metadata(),
+                                globalIndex.indexMeta(),
+                                route.getValue())) {
+                    routedIndexFiles.add(entry.indexFile());
+                    break;
+                }
             }
         }
         return routedIndexFiles;

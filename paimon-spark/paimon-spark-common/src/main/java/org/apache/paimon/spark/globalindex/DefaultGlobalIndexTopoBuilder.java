@@ -47,6 +47,7 @@ import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.CloseableIterator;
 import org.apache.paimon.utils.InstantiationUtil;
+import org.apache.paimon.utils.MurmurHashUtils;
 import org.apache.paimon.utils.Pair;
 import org.apache.paimon.utils.Range;
 import org.apache.paimon.vector.index.VectorGlobalModelTrainer;
@@ -54,25 +55,32 @@ import org.apache.paimon.vector.index.VectorGlobalModelTrainers;
 import org.apache.paimon.vector.index.VectorTrainingModel;
 
 import org.apache.spark.Partitioner;
+import org.apache.spark.TaskContext;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation;
-
-import scala.Tuple2;
+import org.apache.spark.util.TaskCompletionListener;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
+
+import scala.Tuple2;
 
 import static org.apache.paimon.CoreOptions.GLOBAL_INDEX_BUILD_MAX_PARALLELISM;
 import static org.apache.paimon.CoreOptions.GLOBAL_INDEX_COLUMN_UPDATE_ACTION;
@@ -92,6 +100,8 @@ import static org.apache.paimon.vector.index.NativeVectorIndexOptions.VECTOR_ROU
 
 /** Default topology builder. */
 public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder {
+
+    private static final Logger LOG = LoggerFactory.getLogger(DefaultGlobalIndexTopoBuilder.class);
 
     @Override
     public List<CommitMessage> buildIndex(
@@ -257,8 +267,7 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
                 IvfPqShard.CENTROID_BASED.optionValue());
         checkArgument(
                 CENTROID_TRAIN_MODE_LOCAL.equals(
-                        options.getString(
-                                CENTROID_TRAIN_MODE_OPTION, CENTROID_TRAIN_MODE_LOCAL)),
+                        options.getString(CENTROID_TRAIN_MODE_OPTION, CENTROID_TRAIN_MODE_LOCAL)),
                 "The centroid-sharded implementation of '%s=%s' currently supports only '%s=%s'.",
                 IVF_PQ_SHARD_OPTION,
                 IvfPqShard.CENTROID_BASED.optionValue(),
@@ -272,7 +281,7 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
 
         CentroidShardedIvfPqIndexBuildPlanner planner =
                 CentroidShardedIvfPqIndexBuildPlanner.create(
-                table, snapshot, indexType, indexField, partitionPredicate);
+                        table, snapshot, indexType, indexField, partitionPredicate);
         if (planner.isEmpty()) {
             return Collections.emptyList();
         }
@@ -283,6 +292,7 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
 
         Map<String, String> nativeOptions =
                 CentroidShardedIvfPqIndexBuilder.nativeOptions(indexType, indexField, options);
+        configureExpectedVectorCount(nativeOptions, expectedVectorCount(splits));
         String centroidBackend = centroidBackend(options);
         long trainingSampleRows = trainingSampleRows(indexType, indexField, options);
         List<IndexedSplit> trainingSplits =
@@ -291,7 +301,7 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
         try (VectorGlobalModelTrainer trainer =
                 VectorGlobalModelTrainers.create(centroidBackend, indexType, nativeOptions)) {
             collectTrainingSamplesForCentroidBuild(
-                    table, readType, indexField, trainingSplits, trainer);
+                    table, readType, indexField, trainingSplits, trainer, trainingSampleRows);
             trainingModel = trainer.finishTraining();
         }
 
@@ -327,13 +337,14 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
                         indexType,
                         resultEntries);
         DataIncrement dataIncrement = DataIncrement.indexIncrement(indexFileMetas);
-        return Collections.singletonList(
-                new CommitMessageImpl(
-                        BinaryRow.EMPTY_ROW,
-                        0,
-                        null,
-                        dataIncrement,
-                        CompactIncrement.emptyIncrement()));
+        return Collections.singletonList(centroidCommitMessage(planner.partition(), dataIncrement));
+    }
+
+    static CommitMessage centroidCommitMessage(BinaryRow partition, DataIncrement dataIncrement) {
+        // A centroid-sharded index covers the complete logical partition rather than one data
+        // bucket. Bucket 0 is therefore the synthetic home for this partition-level index.
+        return new CommitMessageImpl(
+                partition, 0, null, dataIncrement, CompactIncrement.emptyIncrement());
     }
 
     private static void collectTrainingSamplesForCentroidBuild(
@@ -341,9 +352,14 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
             RowType readType,
             DataField indexField,
             List<IndexedSplit> splits,
-            VectorGlobalModelTrainer trainer)
+            VectorGlobalModelTrainer trainer,
+            long trainingSampleRows)
             throws IOException {
+        long remainingSamples = trainingSampleRows < 0 ? Long.MAX_VALUE : trainingSampleRows;
         for (IndexedSplit split : splits) {
+            if (remainingSamples == 0) {
+                break;
+            }
             CentroidShardedIvfPqIndexBuilder indexBuilder =
                     CentroidShardedIvfPqIndexBuilder.forTrainingSamples(
                             table, readType, indexField, split.rowRanges());
@@ -351,10 +367,8 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
             builder.withReadType(readType);
             try (RecordReader<InternalRow> recordReader = builder.newRead().createReader(split);
                     CloseableIterator<InternalRow> data = recordReader.toCloseableIterator()) {
-                for (CentroidShardedIvfPqIndexBuilder.TrainingSample sample :
-                        indexBuilder.collectTrainingSamples(data)) {
-                    trainer.write(sample.vector(), sample.absoluteRowId());
-                }
+                long written = indexBuilder.writeTrainingSamples(data, trainer, remainingSamples);
+                remainingSamples -= written;
             } catch (RuntimeException e) {
                 throw e;
             } catch (Exception e) {
@@ -380,12 +394,7 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
             return sampleRows;
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException(
-                    "Invalid value for '"
-                            + key
-                            + "': "
-                            + value
-                            + ". Must be a positive long.",
-                    e);
+                    "Invalid value for '" + key + "': " + value + ". Must be a positive long.", e);
         }
     }
 
@@ -395,25 +404,47 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
             return splits;
         }
 
+        List<TrainingFile> candidates = new ArrayList<>();
+        for (IndexedSplit split : splits) {
+            for (DataFileMeta file : split.dataSplit().dataFiles()) {
+                candidates.add(new TrainingFile(split, file));
+            }
+        }
+        candidates.sort(
+                Comparator.comparingLong(TrainingFile::samplingKey)
+                        .thenComparing(candidate -> candidate.file.fileName()));
+
         List<IndexedSplit> result = new ArrayList<>();
         long selectedRows = 0;
-        for (IndexedSplit split : splits) {
-            List<DataFileMeta> selectedFiles = new ArrayList<>();
-            for (DataFileMeta file : split.dataSplit().dataFiles()) {
-                selectedFiles.add(file);
-                selectedRows = saturatedAdd(selectedRows, file.rowCount());
-                if (selectedRows > trainingSampleRows) {
-                    break;
-                }
-            }
-            if (!selectedFiles.isEmpty()) {
-                result.add(copySplitWithDataFiles(split, selectedFiles));
-            }
-            if (selectedRows > trainingSampleRows) {
+        for (TrainingFile candidate : candidates) {
+            result.add(
+                    copySplitWithDataFiles(
+                            candidate.split, Collections.singletonList(candidate.file)));
+            selectedRows = saturatedAdd(selectedRows, candidate.file.rowCount());
+            if (selectedRows >= trainingSampleRows) {
                 break;
             }
         }
         return result;
+    }
+
+    static long expectedVectorCount(List<IndexedSplit> splits) {
+        long expectedVectorCount = 0;
+        for (IndexedSplit split : splits) {
+            for (DataFileMeta file : split.dataSplit().dataFiles()) {
+                expectedVectorCount = saturatedAdd(expectedVectorCount, file.rowCount());
+            }
+        }
+        return expectedVectorCount;
+    }
+
+    static void configureExpectedVectorCount(
+            Map<String, String> nativeOptions, long expectedVectorCount) {
+        String nlist = nativeOptions.get("nlist");
+        if ((nlist == null || "auto".equalsIgnoreCase(nlist.trim()))
+                && !nativeOptions.containsKey("expected-vector-count")) {
+            nativeOptions.put("expected-vector-count", Long.toString(expectedVectorCount));
+        }
     }
 
     private static IndexedSplit copySplitWithDataFiles(
@@ -454,50 +485,59 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
         JavaSparkContext javaSparkContext = new JavaSparkContext(spark.sparkContext());
         byte[] trainingModelPayload = serializeTrainingModelPayload(trainingModel);
         int nlist = trainingModel.centroids().nlist();
-        List<Pair<byte[], byte[]>> taskList = new ArrayList<>();
+        List<IndexedSplit> taskList = new ArrayList<>();
         for (IndexedSplit split : splits) {
-            CentroidShardedIvfPqIndexBuilder assignBuilder =
-                    CentroidShardedIvfPqIndexBuilder.forCentroidAssignment(
-                            table,
-                            readType,
-                            indexField,
-                            split.rowRanges(),
-                            centroidBackend,
-                            indexType,
-                            nativeOptions,
-                            trainingModelPayload);
-            taskList.add(
-                    Pair.of(
-                            InstantiationUtil.serializeObject(assignBuilder),
-                            InstantiationUtil.serializeObject(split)));
+            taskList.add(split);
         }
         if (taskList.isEmpty()) {
             return Collections.emptyList();
         }
 
-        int scanParallelism = parallelism(taskList.size(), options);
-        JavaPairRDD<Integer, CentroidShardedIvfPqIndexBuilder.AssignedVector> assignedVectors =
-                centroidAssignLazyStreaming(options)
-                        ? javaSparkContext
-                                .parallelize(taskList, scanParallelism)
-                                .flatMapToPair(
-                                        DefaultGlobalIndexTopoBuilder
-                                                ::assignCentroidVectorsLazyStreaming)
-                        : javaSparkContext
-                                .parallelize(taskList, scanParallelism)
-                                .flatMapToPair(
-                                        DefaultGlobalIndexTopoBuilder::assignCentroidVectors);
+        Broadcast<byte[]> trainingModelBroadcast = javaSparkContext.broadcast(trainingModelPayload);
+        List<byte[]> shardResultBytes;
+        try {
+            int scanParallelism = parallelism(taskList.size(), options);
+            AssignmentTaskContext assignmentContext =
+                    new AssignmentTaskContext(
+                            table,
+                            readType,
+                            indexField,
+                            centroidBackend,
+                            indexType,
+                            nativeOptions,
+                            trainingModelBroadcast);
+            JavaPairRDD<Integer, CentroidShardedIvfPqIndexBuilder.AssignedVector> assignedVectors =
+                    centroidAssignLazyStreaming(options)
+                            ? javaSparkContext
+                                    .parallelize(taskList, scanParallelism)
+                                    .flatMapToPair(
+                                            task ->
+                                                    assignCentroidVectorsLazyStreaming(
+                                                            task, assignmentContext))
+                            : javaSparkContext
+                                    .parallelize(taskList, scanParallelism)
+                                    .flatMapToPair(
+                                            task -> assignCentroidVectors(task, assignmentContext));
 
-        CentroidShardedIvfPqIndexBuilder shardBuilder =
-                CentroidShardedIvfPqIndexBuilder.forShardBuild(
-                        table, centroidBackend, indexType, nativeOptions, trainingModelPayload);
-        byte[] shardBuilderBytes = InstantiationUtil.serializeObject(shardBuilder);
-        List<byte[]> shardResultBytes =
-                assignedVectors
-                        .partitionBy(new CentroidPartitioner(nlist))
-                        .mapPartitions(
-                                partition -> buildCentroidShardPartition(partition, shardBuilderBytes))
-                        .collect();
+            CentroidShardedIvfPqIndexBuilder shardBuilder =
+                    CentroidShardedIvfPqIndexBuilder.forShardBuild(
+                            table, centroidBackend, indexType, nativeOptions);
+            byte[] shardBuilderBytes = InstantiationUtil.serializeObject(shardBuilder);
+            int shardParallelism = parallelism(nlist, options);
+            shardResultBytes =
+                    assignedVectors
+                            .repartitionAndSortWithinPartitions(
+                                    new CentroidPartitioner(nlist, shardParallelism))
+                            .mapPartitions(
+                                    partition ->
+                                            buildCentroidShardPartition(
+                                                    partition,
+                                                    shardBuilderBytes,
+                                                    trainingModelBroadcast.value()))
+                            .collect();
+        } finally {
+            trainingModelBroadcast.destroy(false);
+        }
 
         List<CentroidShardedIvfPqIndexBuilder.ShardBuildResult> dataShardResults =
                 new ArrayList<>();
@@ -517,8 +557,7 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
         }
 
         List<ResultEntry> resultEntries = new ArrayList<>();
-        for (CentroidShardedIvfPqIndexBuilder.ShardBuildResult dataShardResult :
-                dataShardResults) {
+        for (CentroidShardedIvfPqIndexBuilder.ShardBuildResult dataShardResult : dataShardResults) {
             resultEntries.add(dataShardResult.toResultEntry());
         }
 
@@ -558,13 +597,10 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
         return out.toByteArray();
     }
 
-    private static Iterator<
-                    Tuple2<Integer, CentroidShardedIvfPqIndexBuilder.AssignedVector>>
-            assignCentroidVectors(Pair<byte[], byte[]> task) throws Exception {
-        ClassLoader classLoader = DefaultGlobalIndexTopoBuilder.class.getClassLoader();
-        CentroidShardedIvfPqIndexBuilder indexBuilder =
-                InstantiationUtil.deserializeObject(task.getLeft(), classLoader);
-        IndexedSplit split = InstantiationUtil.deserializeObject(task.getRight(), classLoader);
+    private static Iterator<Tuple2<Integer, CentroidShardedIvfPqIndexBuilder.AssignedVector>>
+            assignCentroidVectors(IndexedSplit split, AssignmentTaskContext context)
+                    throws Exception {
+        CentroidShardedIvfPqIndexBuilder indexBuilder = context.newBuilder(split.rowRanges());
         ReadBuilder builder = indexBuilder.table().newReadBuilder();
         builder.withReadType(indexBuilder.readType());
 
@@ -578,13 +614,10 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
         }
     }
 
-    private static Iterator<
-                    Tuple2<Integer, CentroidShardedIvfPqIndexBuilder.AssignedVector>>
-            assignCentroidVectorsLazyStreaming(Pair<byte[], byte[]> task) throws Exception {
-        ClassLoader classLoader = DefaultGlobalIndexTopoBuilder.class.getClassLoader();
-        CentroidShardedIvfPqIndexBuilder indexBuilder =
-                InstantiationUtil.deserializeObject(task.getLeft(), classLoader);
-        IndexedSplit split = InstantiationUtil.deserializeObject(task.getRight(), classLoader);
+    private static Iterator<Tuple2<Integer, CentroidShardedIvfPqIndexBuilder.AssignedVector>>
+            assignCentroidVectorsLazyStreaming(IndexedSplit split, AssignmentTaskContext context)
+                    throws Exception {
+        CentroidShardedIvfPqIndexBuilder indexBuilder = context.newBuilder(split.rowRanges());
         ReadBuilder builder = indexBuilder.table().newReadBuilder();
         builder.withReadType(indexBuilder.readType());
 
@@ -593,8 +626,15 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
         try {
             recordReader = builder.newRead().createReader(split);
             data = recordReader.toCloseableIterator();
-            return new ClosingIterator<>(
-                    indexBuilder.assignCentroidVectorsLazy(data), data, recordReader, indexBuilder);
+            ClosingIterator<Tuple2<Integer, CentroidShardedIvfPqIndexBuilder.AssignedVector>>
+                    closingIterator =
+                            new ClosingIterator<>(
+                                    indexBuilder.assignCentroidVectorsLazy(data),
+                                    data,
+                                    recordReader,
+                                    indexBuilder);
+            registerTaskCompletionClose(closingIterator);
+            return closingIterator;
         } catch (Throwable t) {
             closeQuietly(data, t);
             closeQuietly(recordReader, t);
@@ -605,7 +645,8 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
 
     private static Iterator<byte[]> buildCentroidShardPartition(
             Iterator<Tuple2<Integer, CentroidShardedIvfPqIndexBuilder.AssignedVector>> partition,
-            byte[] shardBuilderBytes)
+            byte[] shardBuilderBytes,
+            byte[] modelPayload)
             throws Exception {
         if (!partition.hasNext()) {
             return Collections.emptyIterator();
@@ -614,6 +655,7 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
         ClassLoader classLoader = DefaultGlobalIndexTopoBuilder.class.getClassLoader();
         CentroidShardedIvfPqIndexBuilder indexBuilder =
                 InstantiationUtil.deserializeObject(shardBuilderBytes, classLoader);
+        indexBuilder.setBroadcastTrainingModelPayload(modelPayload);
         try {
             List<byte[]> resultEntries = new ArrayList<>();
             for (CentroidShardedIvfPqIndexBuilder.ShardBuildResult result :
@@ -623,14 +665,6 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
             return resultEntries.iterator();
         } finally {
             indexBuilder.close();
-        }
-    }
-
-    private static void closeDataIterator(CloseableIterator<?> data) throws IOException {
-        try {
-            data.close();
-        } catch (Exception e) {
-            throw new IOException("Failed to close data iterator.", e);
         }
     }
 
@@ -656,8 +690,8 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
         return backend;
     }
 
-    private static boolean centroidAssignLazyStreaming(Options options) {
-        String value = options.getString(CENTROID_ASSIGN_LAZY_STREAMING_OPTION, "false").trim();
+    static boolean centroidAssignLazyStreaming(Options options) {
+        String value = options.getString(CENTROID_ASSIGN_LAZY_STREAMING_OPTION, "true").trim();
         checkArgument(
                 "true".equalsIgnoreCase(value) || "false".equalsIgnoreCase(value),
                 "Option '%s' supports only 'true' or 'false', but was '%s'.",
@@ -735,26 +769,31 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
     /**
      * Partitions assigned vectors directly by centroid.
      *
-     * <p>The key of {@code assignedVectors} is already the centroid returned by the global
-     * training model. Mapping Spark partition to centroid makes the shuffle contract explicit: all
-     * vectors assigned to centroid {@code c} go to Spark partition {@code c}. This avoids relying on
-     * the implementation detail that Spark's {@code HashPartitioner} maps {@code Integer c} to
-     * {@code c % nlist}.
+     * <p>The key is the centroid returned by the global model. Multiple centroids may share one
+     * physical Spark partition so large {@code nlist} values do not create an unbounded number of
+     * tasks. Modulo mapping is deterministic and keeps all vectors for one centroid together.
      */
-    private static class CentroidPartitioner extends Partitioner {
+    static class CentroidPartitioner extends Partitioner {
 
         private static final long serialVersionUID = 1L;
 
-        private final int nlist;
+        private final int centroidCount;
+        private final int physicalPartitionCount;
 
-        private CentroidPartitioner(int nlist) {
-            checkArgument(nlist > 0, "Centroid partitioner requires positive nlist.");
-            this.nlist = nlist;
+        CentroidPartitioner(int centroidCount, int physicalPartitionCount) {
+            checkArgument(centroidCount > 0, "Centroid partitioner requires positive nlist.");
+            checkArgument(
+                    physicalPartitionCount > 0 && physicalPartitionCount <= centroidCount,
+                    "Centroid physical partition count must be in [1, %s], but was %s.",
+                    centroidCount,
+                    physicalPartitionCount);
+            this.centroidCount = centroidCount;
+            this.physicalPartitionCount = physicalPartitionCount;
         }
 
         @Override
         public int numPartitions() {
-            return nlist;
+            return physicalPartitionCount;
         }
 
         @Override
@@ -765,21 +804,21 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
                     key == null ? "null" : key.getClass().getName());
             int centroid = (Integer) key;
             checkArgument(
-                    centroid >= 0 && centroid < nlist,
+                    centroid >= 0 && centroid < centroidCount,
                     "Centroid %s is out of range [0, %s).",
                     centroid,
-                    nlist);
-            return centroid;
+                    centroidCount);
+            return centroid % physicalPartitionCount;
         }
     }
 
-    private static class ClosingIterator<T> implements Iterator<T> {
+    static class ClosingIterator<T> implements Iterator<T> {
 
         private final Iterator<T> delegate;
         private final AutoCloseable[] closeables;
         private boolean closed;
 
-        private ClosingIterator(Iterator<T> delegate, AutoCloseable... closeables) {
+        ClosingIterator(Iterator<T> delegate, AutoCloseable... closeables) {
             this.delegate = delegate;
             this.closeables = closeables;
         }
@@ -850,6 +889,94 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
                     error.addSuppressed(closeError);
                 }
             }
+        }
+
+        void closeFromTaskCompletion() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            for (AutoCloseable closeable : closeables) {
+                if (closeable == null) {
+                    continue;
+                }
+                try {
+                    closeable.close();
+                } catch (Throwable closeError) {
+                    LOG.warn(
+                            "Failed to close centroid assignment resource on task completion.",
+                            closeError);
+                }
+            }
+        }
+    }
+
+    private static void registerTaskCompletionClose(ClosingIterator<?> iterator) {
+        TaskContext taskContext = TaskContext.get();
+        if (taskContext != null) {
+            taskContext.addTaskCompletionListener(
+                    (TaskCompletionListener) ignored -> iterator.closeFromTaskCompletion());
+        }
+    }
+
+    private static class AssignmentTaskContext implements java.io.Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private final FileStoreTable table;
+        private final RowType readType;
+        private final DataField indexField;
+        private final String backend;
+        private final String indexType;
+        private final Map<String, String> nativeOptions;
+        private final Broadcast<byte[]> trainingModelBroadcast;
+
+        private AssignmentTaskContext(
+                FileStoreTable table,
+                RowType readType,
+                DataField indexField,
+                String backend,
+                String indexType,
+                Map<String, String> nativeOptions,
+                Broadcast<byte[]> trainingModelBroadcast) {
+            this.table = table;
+            this.readType = readType;
+            this.indexField = indexField;
+            this.backend = backend;
+            this.indexType = indexType;
+            this.nativeOptions = nativeOptions;
+            this.trainingModelBroadcast = trainingModelBroadcast;
+        }
+
+        private CentroidShardedIvfPqIndexBuilder newBuilder(List<Range> rowRanges) {
+            CentroidShardedIvfPqIndexBuilder builder =
+                    CentroidShardedIvfPqIndexBuilder.forCentroidAssignment(
+                            table,
+                            readType,
+                            indexField,
+                            rowRanges,
+                            backend,
+                            indexType,
+                            nativeOptions);
+            builder.setBroadcastTrainingModelPayload(trainingModelBroadcast.value());
+            return builder;
+        }
+    }
+
+    private static class TrainingFile {
+
+        private final IndexedSplit split;
+        private final DataFileMeta file;
+
+        private TrainingFile(IndexedSplit split, DataFileMeta file) {
+            this.split = split;
+            this.file = file;
+        }
+
+        private long samplingKey() {
+            byte[] key =
+                    (file.fileName() + ':' + file.firstRowId()).getBytes(StandardCharsets.UTF_8);
+            return Integer.toUnsignedLong(MurmurHashUtils.hashBytes(key));
         }
     }
 }

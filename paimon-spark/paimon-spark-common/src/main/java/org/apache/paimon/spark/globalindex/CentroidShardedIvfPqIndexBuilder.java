@@ -21,8 +21,8 @@ package org.apache.paimon.spark.globalindex;
 import org.apache.paimon.data.InternalArray;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.globalindex.GlobalIndexFileReadWrite;
-import org.apache.paimon.globalindex.IndexFileKind;
 import org.apache.paimon.globalindex.GlobalIndexSingleColumnWriter;
+import org.apache.paimon.globalindex.IndexFileKind;
 import org.apache.paimon.globalindex.IvfPqShard;
 import org.apache.paimon.globalindex.ResultEntry;
 import org.apache.paimon.table.FileStoreTable;
@@ -34,11 +34,10 @@ import org.apache.paimon.utils.CloseableIterator;
 import org.apache.paimon.utils.Range;
 import org.apache.paimon.vector.index.VectorCentroidModel;
 import org.apache.paimon.vector.index.VectorGlobalIndexFileMeta;
+import org.apache.paimon.vector.index.VectorGlobalModelTrainer;
 import org.apache.paimon.vector.index.VectorGlobalModelTrainers;
 import org.apache.paimon.vector.index.VectorIndexMeta;
 import org.apache.paimon.vector.index.VectorTrainingModel;
-
-import scala.Tuple2;
 
 import javax.annotation.Nullable;
 
@@ -47,12 +46,13 @@ import java.io.OutputStream;
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
+
+import scala.Tuple2;
 
 /** Builder for centroid-sharded IVF/PQ global index. */
 public class CentroidShardedIvfPqIndexBuilder implements Serializable, AutoCloseable {
@@ -66,15 +66,12 @@ public class CentroidShardedIvfPqIndexBuilder implements Serializable, AutoClose
     @Nullable private transient VectorTrainingModel trainingModel;
     @Nullable private final String trainingModelBackend;
     @Nullable private final String trainingModelIndexType;
-    @Nullable private final byte[] trainingModelPayload;
+    @Nullable private byte[] trainingModelPayload;
     private final Map<String, String> nativeOptions;
 
     /** Creates a builder used by scan-side tasks to collect centroid training samples. */
     public static CentroidShardedIvfPqIndexBuilder forTrainingSamples(
-            FileStoreTable table,
-            RowType readType,
-            DataField indexField,
-            List<Range> rowRanges) {
+            FileStoreTable table, RowType readType, DataField indexField, List<Range> rowRanges) {
         return new CentroidShardedIvfPqIndexBuilder(
                 table,
                 readType,
@@ -109,6 +106,30 @@ public class CentroidShardedIvfPqIndexBuilder implements Serializable, AutoClose
                 nativeOptions);
     }
 
+    /**
+     * Creates an assignment builder whose model payload will be supplied from a Spark broadcast on
+     * the executor.
+     */
+    public static CentroidShardedIvfPqIndexBuilder forCentroidAssignment(
+            FileStoreTable table,
+            RowType readType,
+            DataField indexField,
+            List<Range> rowRanges,
+            String backend,
+            String indexType,
+            Map<String, String> nativeOptions) {
+        return new CentroidShardedIvfPqIndexBuilder(
+                table,
+                readType,
+                indexField,
+                rowRanges,
+                null,
+                backend,
+                indexType,
+                null,
+                nativeOptions);
+    }
+
     /** Creates a builder used by shuffle-side tasks to write one or more centroid shard files. */
     public static CentroidShardedIvfPqIndexBuilder forShardBuild(
             FileStoreTable table,
@@ -125,6 +146,24 @@ public class CentroidShardedIvfPqIndexBuilder implements Serializable, AutoClose
                 backend,
                 indexType,
                 trainingModelPayload,
+                nativeOptions);
+    }
+
+    /** Creates a shard builder whose model payload is supplied from a Spark broadcast. */
+    public static CentroidShardedIvfPqIndexBuilder forShardBuild(
+            FileStoreTable table,
+            String backend,
+            String indexType,
+            Map<String, String> nativeOptions) {
+        return new CentroidShardedIvfPqIndexBuilder(
+                table,
+                null,
+                null,
+                Collections.emptyList(),
+                null,
+                backend,
+                indexType,
+                null,
                 nativeOptions);
     }
 
@@ -192,6 +231,37 @@ public class CentroidShardedIvfPqIndexBuilder implements Serializable, AutoClose
             samples.add(new TrainingSample(absoluteRowId, toFloatVector(vectorObject)));
         }
         return samples;
+    }
+
+    /** Streams at most {@code maxSamples} eligible rows directly into the trainer. */
+    public long writeTrainingSamples(
+            CloseableIterator<InternalRow> rows, VectorGlobalModelTrainer trainer, long maxSamples)
+            throws IOException {
+        InternalRow.FieldGetter vectorGetter = vectorGetter();
+        int rowIdIndex = rowIdIndex();
+        long written = 0;
+        while (written < maxSamples && rows.hasNext()) {
+            InternalRow row = rows.next();
+            long absoluteRowId = row.getLong(rowIdIndex);
+            if (!containsRowId(absoluteRowId)) {
+                continue;
+            }
+            Object vectorObject = vectorGetter.getFieldOrNull(row);
+            if (vectorObject == null) {
+                continue;
+            }
+            trainer.write(toFloatVector(vectorObject), absoluteRowId);
+            written++;
+        }
+        return written;
+    }
+
+    /** Installs the immutable model payload obtained from a Spark broadcast. */
+    public void setBroadcastTrainingModelPayload(byte[] trainingModelPayload) {
+        if (trainingModel != null) {
+            throw new IllegalStateException("The vector training model is already initialized.");
+        }
+        this.trainingModelPayload = requireNonNull(trainingModelPayload, "trainingModelPayload");
     }
 
     public List<Tuple2<Integer, AssignedVector>> assignCentroidVectors(
@@ -267,19 +337,29 @@ public class CentroidShardedIvfPqIndexBuilder implements Serializable, AutoClose
         };
     }
 
+    /** Builds centroid shards from input sorted by centroid id. */
     public List<ShardBuildResult> buildCentroidShards(
             Iterator<Tuple2<Integer, AssignedVector>> assignedVectors) throws IOException {
         GlobalIndexFileReadWrite fileReadWrite =
                 new GlobalIndexFileReadWrite(
                         table.fileIO(), table.store().pathFactory().globalIndexFileFactory());
-        Map<Integer, GlobalIndexSingleColumnWriter> writers = new HashMap<>();
+        List<ShardBuildResult> results = new ArrayList<>();
+        int currentCentroid = -1;
+        GlobalIndexSingleColumnWriter writer = null;
         try {
             while (assignedVectors.hasNext()) {
                 Tuple2<Integer, AssignedVector> tuple = assignedVectors.next();
                 int centroid = tuple._1();
                 AssignedVector vector = tuple._2();
-                GlobalIndexSingleColumnWriter writer = writers.get(centroid);
-                if (writer == null) {
+                if (writer != null && centroid < currentCentroid) {
+                    throw new IllegalArgumentException(
+                            "Centroid shard input must be sorted by centroid id.");
+                }
+                if (writer == null || centroid != currentCentroid) {
+                    if (writer != null) {
+                        finishCentroidWriter(results, currentCentroid, writer);
+                        writer = null;
+                    }
                     // The physical native index build is delegated to the shard writer. For the
                     // native backend, NativeCentroidShardIndexWriter derives a centroid-specific
                     // VectorIndexTraining from the global model, constructs VectorIndexWriter,
@@ -289,29 +369,33 @@ public class CentroidShardedIvfPqIndexBuilder implements Serializable, AutoClose
                             trainingModel()
                                     .createCentroidShardIndexWriter(
                                             fileReadWrite, centroid, nativeOptions);
-                    writers.put(centroid, writer);
+                    currentCentroid = centroid;
                 }
                 writer.write(vector.vector(), vector.absoluteRowId());
             }
-
-            List<ShardBuildResult> results = new ArrayList<>();
-            List<Integer> centroids = new ArrayList<>(writers.keySet());
-            Collections.sort(centroids);
-            for (Integer centroid : centroids) {
-                GlobalIndexSingleColumnWriter writer = writers.remove(centroid);
-                try {
-                    for (ResultEntry resultEntry : writer.finish()) {
-                        results.add(new ShardBuildResult(centroid, resultEntry));
-                    }
-                } finally {
-                    closeWriter(writer);
-                }
+            if (writer != null) {
+                finishCentroidWriter(results, currentCentroid, writer);
+                writer = null;
             }
             return results;
         } finally {
-            for (GlobalIndexSingleColumnWriter writer : writers.values()) {
+            if (writer != null) {
                 closeWriter(writer);
             }
+        }
+    }
+
+    private static void finishCentroidWriter(
+            List<ShardBuildResult> results,
+            int centroid,
+            GlobalIndexSingleColumnWriter writer)
+            throws IOException {
+        try {
+            for (ResultEntry resultEntry : writer.finish()) {
+                results.add(new ShardBuildResult(centroid, resultEntry));
+            }
+        } finally {
+            closeWriter(writer);
         }
     }
 
@@ -331,7 +415,11 @@ public class CentroidShardedIvfPqIndexBuilder implements Serializable, AutoClose
         return new ResultEntry(
                 fileName,
                 0,
-                VectorIndexMeta.routingModel(IvfPqShard.CENTROID_BASED).serialize(),
+                VectorIndexMeta.routingModel(
+                                IvfPqShard.CENTROID_BASED,
+                                trainingModel().centroids().nlist(),
+                                trainingModel().modelDigest())
+                        .serialize(),
                 IndexFileKind.ROUTING_MODEL);
     }
 
@@ -380,8 +468,19 @@ public class CentroidShardedIvfPqIndexBuilder implements Serializable, AutoClose
         if ("metric".equals(key) || "distance.metric".equals(key)) {
             return "metric";
         }
-        if ("nlist".equals(key) || "pq.m".equals(key) || "pq.bits".equals(key)) {
+        if ("nlist".equals(key)
+                || "expected-vector-count".equals(key)
+                || "pq.m".equals(key)
+                || "pq.code-ratio".equals(key)
+                || "pq.bits".equals(key)
+                || "rq.bits".equals(key)
+                || "target-recall".equals(key)
+                || "max-bytes-per-vector".equals(key)
+                || "deployment-profile".equals(key)) {
             return key;
+        }
+        if ("pq.use-opq".equals(key) || "use-opq".equals(key)) {
+            return "use-opq";
         }
         return null;
     }
@@ -547,7 +646,8 @@ public class CentroidShardedIvfPqIndexBuilder implements Serializable, AutoClose
         }
 
         public ResultEntry toResultEntry() {
-            return new ResultEntry(fileName, rowCount, meta == null ? null : meta.clone(), rowRange);
+            return new ResultEntry(
+                    fileName, rowCount, meta == null ? null : meta.clone(), rowRange);
         }
     }
 }
