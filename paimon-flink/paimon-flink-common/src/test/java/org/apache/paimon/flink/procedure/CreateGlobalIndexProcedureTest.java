@@ -28,6 +28,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link CreateGlobalIndexProcedure}. */
 public class CreateGlobalIndexProcedureTest {
@@ -50,5 +51,29 @@ public class CreateGlobalIndexProcedureTest {
                 .isEqualTo(200L);
         assertThat(userOptions.get("unrelated-table-option")).isEqualTo("table-value");
         assertThat(userOptions.get("procedure-only")).isEqualTo("procedure-value");
+    }
+
+    @Test
+    public void testRejectUnsupportedCentroidDistributedBuild() {
+        Options defaults = new Options();
+        CreateGlobalIndexProcedure.validateUnsupportedCentroidDistributedBuild(defaults);
+
+        Options centroid = new Options();
+        centroid.set("ivf.pq.shard", "centroid-based");
+        assertThatThrownBy(
+                        () ->
+                                CreateGlobalIndexProcedure
+                                        .validateUnsupportedCentroidDistributedBuild(centroid))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("use the Spark procedure");
+
+        Options distributed = new Options();
+        distributed.set("ivf.pq.train.mode", "distributed");
+        assertThatThrownBy(
+                        () ->
+                                CreateGlobalIndexProcedure
+                                        .validateUnsupportedCentroidDistributedBuild(distributed))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("use the Spark procedure");
     }
 }

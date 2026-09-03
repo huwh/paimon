@@ -113,6 +113,7 @@ public class CreateGlobalIndexProcedure extends ProcedureBase {
 
         // Parse options
         Options userOptions = createUserOptions(table, options);
+        validateUnsupportedCentroidDistributedBuild(userOptions);
 
         indexType = indexType.toLowerCase().trim();
         if (indexColumns.size() > 1) {
@@ -168,6 +169,23 @@ public class CreateGlobalIndexProcedure extends ProcedureBase {
                     + " global index created successfully for table: "
                     + table.name()
         };
+    }
+
+    static void validateUnsupportedCentroidDistributedBuild(Options options) {
+        final String shardOption = "ivf.pq.shard";
+        final String trainModeOption = "ivf.pq.train.mode";
+        boolean centroidSharding =
+                "centroid-based".equalsIgnoreCase(options.getString(shardOption, "range").trim());
+        boolean distributedTraining =
+                "distributed".equalsIgnoreCase(options.getString(trainModeOption, "local").trim());
+        checkArgument(
+                !centroidSharding && !distributedTraining,
+                "Flink create_global_index does not support '%s=%s' or '%s=%s'; "
+                        + "use the Spark procedure for centroid-sharded distributed IVF-PQ builds.",
+                shardOption,
+                "centroid-based",
+                trainModeOption,
+                "distributed");
     }
 
     private PartitionPredicate parsePartitionPredicate(FileStoreTable table, String partitions) {

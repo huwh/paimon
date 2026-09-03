@@ -256,6 +256,61 @@ public class CentroidShardedIvfPqIndexBuilder implements Serializable, AutoClose
         return written;
     }
 
+    /** Lazily exposes a bounded number of eligible vectors without retaining input rows. */
+    public Iterator<float[]> trainingVectorsLazy(
+            CloseableIterator<InternalRow> rows, long maxVectors) {
+        if (maxVectors <= 0) {
+            throw new IllegalArgumentException("maxVectors must be greater than 0.");
+        }
+        return new Iterator<float[]>() {
+
+            private final InternalRow.FieldGetter vectorGetter = vectorGetter();
+            private final int rowIdIndex = rowIdIndex();
+            private float[] next;
+            private boolean nextReady;
+            private long emitted;
+
+            @Override
+            public boolean hasNext() {
+                prepareNext();
+                return nextReady;
+            }
+
+            @Override
+            public float[] next() {
+                prepareNext();
+                if (!nextReady) {
+                    throw new NoSuchElementException();
+                }
+                float[] result = next;
+                next = null;
+                nextReady = false;
+                emitted++;
+                return result;
+            }
+
+            private void prepareNext() {
+                if (nextReady) {
+                    return;
+                }
+                while (emitted < maxVectors && rows.hasNext()) {
+                    InternalRow row = rows.next();
+                    long absoluteRowId = row.getLong(rowIdIndex);
+                    if (!containsRowId(absoluteRowId)) {
+                        continue;
+                    }
+                    Object vectorObject = vectorGetter.getFieldOrNull(row);
+                    if (vectorObject == null) {
+                        continue;
+                    }
+                    next = toFloatVector(vectorObject);
+                    nextReady = true;
+                    return;
+                }
+            }
+        };
+    }
+
     /** Installs the immutable model payload obtained from a Spark broadcast. */
     public void setBroadcastTrainingModelPayload(byte[] trainingModelPayload) {
         if (trainingModel != null) {
@@ -386,9 +441,7 @@ public class CentroidShardedIvfPqIndexBuilder implements Serializable, AutoClose
     }
 
     private static void finishCentroidWriter(
-            List<ShardBuildResult> results,
-            int centroid,
-            GlobalIndexSingleColumnWriter writer)
+            List<ShardBuildResult> results, int centroid, GlobalIndexSingleColumnWriter writer)
             throws IOException {
         try {
             for (ResultEntry resultEntry : writer.finish()) {

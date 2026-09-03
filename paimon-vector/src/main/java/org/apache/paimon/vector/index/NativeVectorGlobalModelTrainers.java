@@ -54,6 +54,11 @@ public class NativeVectorGlobalModelTrainers {
         return NativeVectorTrainingModel.load(indexType, options, payload.clone());
     }
 
+    static VectorTrainingModel fromTraining(
+            String indexType, Map<String, String> options, VectorIndexTraining training) {
+        return new NativeVectorTrainingModel(indexType, options, training);
+    }
+
     /**
      * Java-side trainer for the centroid global IVF/PQ model.
      *

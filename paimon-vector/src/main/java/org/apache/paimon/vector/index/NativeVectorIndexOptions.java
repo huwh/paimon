@@ -29,6 +29,46 @@ public class NativeVectorIndexOptions {
 
     public static final String CENTROID_TRAIN_MODE_LOCAL = "local";
 
+    public static final String CENTROID_TRAIN_MODE_DISTRIBUTED = "distributed";
+
+    public static final String DISTRIBUTED_TRAIN_MAX_ITERATIONS_OPTION =
+            "ivf.pq.train.distributed.max-iterations";
+
+    public static final String DISTRIBUTED_TRAIN_TOLERANCE_OPTION =
+            "ivf.pq.train.distributed.tolerance";
+
+    public static final String DISTRIBUTED_TRAIN_PARTITION_BATCH_SIZE_OPTION =
+            "ivf.pq.train.distributed.partition-batch-size";
+
+    public static final String DISTRIBUTED_TRAIN_MAX_STATE_BYTES_OPTION =
+            "ivf.pq.train.distributed.max-state-bytes";
+
+    public static final String DISTRIBUTED_TRAIN_MAX_PARTIAL_BYTES_OPTION =
+            "ivf.pq.train.distributed.max-partial-bytes";
+
+    public static final String DISTRIBUTED_TRAIN_MAX_DRIVER_PARTIAL_BYTES_OPTION =
+            "ivf.pq.train.distributed.max-driver-partial-bytes";
+
+    public static final String DISTRIBUTED_TRAIN_MAX_BOOTSTRAP_BYTES_OPTION =
+            "ivf.pq.train.distributed.max-bootstrap-bytes";
+
+    public static final String DISTRIBUTED_TRAIN_MAX_PQ_SAMPLE_BYTES_OPTION =
+            "ivf.pq.train.distributed.max-pq-sample-bytes";
+
+    public static final long DEFAULT_DISTRIBUTED_TRAIN_MIN_PQ_SAMPLE_ROWS = 65_536L;
+
+    public static final long DEFAULT_DISTRIBUTED_TRAIN_PQ_SAMPLE_ROWS_PER_CENTROID = 64L;
+
+    public static final long MIN_DISTRIBUTED_TRAIN_PQ_SAMPLE_ROWS = 256L;
+
+    /** Native PQ K-means uses at most 256 samples per codeword (256 * 256). */
+    public static final long MAX_DISTRIBUTED_TRAIN_PQ_SAMPLE_ROWS = 65_536L;
+
+    public static final long DEFAULT_DISTRIBUTED_TRAIN_MAX_PQ_SAMPLE_BYTES = 256L * 1024 * 1024;
+
+    /** The native sparse accumulator format rejects a larger serialized partition partial. */
+    public static final int MAX_DISTRIBUTED_TRAIN_PARTIAL_BYTES = 64 * 1024 * 1024;
+
     public static final String CENTROID_BACKEND_OPTION = "ivf.pq.centroid.backend";
 
     public static final String CENTROID_BACKEND_NATIVE = "native";

@@ -49,6 +49,7 @@ import org.junit.jupiter.api.Test;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -57,6 +58,10 @@ import java.util.stream.Collectors;
 import static org.apache.paimon.CoreOptions.GLOBAL_INDEX_BUILD_MAX_PARALLELISM;
 import static org.apache.paimon.CoreOptions.GLOBAL_INDEX_ROW_COUNT_PER_SHARD;
 import static org.apache.paimon.vector.index.NativeVectorIndexOptions.CENTROID_ASSIGN_LAZY_STREAMING_OPTION;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.CENTROID_TRAIN_MODE_DISTRIBUTED;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.DISTRIBUTED_TRAIN_MAX_PARTIAL_BYTES_OPTION;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.DISTRIBUTED_TRAIN_MAX_PQ_SAMPLE_BYTES_OPTION;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.MAX_DISTRIBUTED_TRAIN_PARTIAL_BYTES;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -127,9 +132,108 @@ public class DefaultGlobalIndexTopoBuilderTest {
     }
 
     @Test
+    void testCentroidTrainingModeValidation() {
+        assertThat(DefaultGlobalIndexTopoBuilder.centroidTrainingMode(new Options()))
+                .isEqualTo("local");
+        assertThat(
+                        DefaultGlobalIndexTopoBuilder.centroidTrainingMode(
+                                new Options(
+                                        Collections.singletonMap(
+                                                "ivf.pq.train.mode", " DISTRIBUTED "))))
+                .isEqualTo(CENTROID_TRAIN_MODE_DISTRIBUTED);
+        assertThatThrownBy(
+                        () ->
+                                DefaultGlobalIndexTopoBuilder.centroidTrainingMode(
+                                        new Options(
+                                                Collections.singletonMap(
+                                                        "ivf.pq.train.mode", "invalid"))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("local")
+                .hasMessageContaining("distributed");
+    }
+
+    @Test
+    void testDistributedTrainingRequiresFixedL2Configuration() {
+        DataField vectorField = new DataField(0, "vec", new VectorType(4, new FloatType()));
+        Map<String, String> autoNlistOptions = distributedNativeOptions();
+        autoNlistOptions.put("nlist", "auto");
+
+        assertThatThrownBy(
+                        () ->
+                                DefaultGlobalIndexTopoBuilder.distributedTrainingSettings(
+                                        "ivf-pq", vectorField, autoNlistOptions, new Options()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("fixed positive option 'nlist'");
+
+        Map<String, String> invalidMetricOptions = distributedNativeOptions();
+        invalidMetricOptions.put("metric", "inner_product");
+        assertThatThrownBy(
+                        () ->
+                                DefaultGlobalIndexTopoBuilder.distributedTrainingSettings(
+                                        "ivf-pq", vectorField, invalidMetricOptions, new Options()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("metric=l2");
+    }
+
+    @Test
+    void testDistributedPqSampleIsClampedByByteLimit() {
+        DataField vectorField = new DataField(0, "vec", new VectorType(4, new FloatType()));
+        Map<String, String> optionMap = new HashMap<>();
+        optionMap.put("ivf-pq.train.sample-rows", "1000");
+        optionMap.put(DISTRIBUTED_TRAIN_MAX_PQ_SAMPLE_BYTES_OPTION, "4096");
+
+        DefaultGlobalIndexTopoBuilder.DistributedTrainingSettings settings =
+                DefaultGlobalIndexTopoBuilder.distributedTrainingSettings(
+                        "ivf-pq", vectorField, distributedNativeOptions(), new Options(optionMap));
+        assertThat(settings.coarseSampleRows()).isEqualTo(1000);
+        assertThat(settings.pqSampleRows()).isEqualTo(256);
+
+        optionMap.put(DISTRIBUTED_TRAIN_MAX_PQ_SAMPLE_BYTES_OPTION, "4080");
+        assertThatThrownBy(
+                        () ->
+                                DefaultGlobalIndexTopoBuilder.distributedTrainingSettings(
+                                        "ivf-pq",
+                                        vectorField,
+                                        distributedNativeOptions(),
+                                        new Options(optionMap)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("max(256, nlist)=256 vectors");
+    }
+
+    @Test
+    void testDistributedPqSampleIsClampedByNativeTrainingLimit() {
+        DataField vectorField = new DataField(0, "vec", new VectorType(4, new FloatType()));
+        Options options =
+                new Options(Collections.singletonMap("ivf-pq.train.sample-rows", "1000000"));
+
+        DefaultGlobalIndexTopoBuilder.DistributedTrainingSettings settings =
+                DefaultGlobalIndexTopoBuilder.distributedTrainingSettings(
+                        "ivf-pq", vectorField, distributedNativeOptions(), options);
+
+        assertThat(settings.coarseSampleRows()).isEqualTo(1_000_000L);
+        assertThat(settings.pqSampleRows()).isEqualTo(65_536);
+    }
+
+    @Test
+    void testDistributedPartialLimitCannotExceedNativeCap() {
+        DataField vectorField = new DataField(0, "vec", new VectorType(4, new FloatType()));
+        Options options =
+                new Options(
+                        Collections.singletonMap(
+                                DISTRIBUTED_TRAIN_MAX_PARTIAL_BYTES_OPTION,
+                                Long.toString((long) MAX_DISTRIBUTED_TRAIN_PARTIAL_BYTES + 1)));
+
+        assertThatThrownBy(
+                        () ->
+                                DefaultGlobalIndexTopoBuilder.distributedTrainingSettings(
+                                        "ivf-pq", vectorField, distributedNativeOptions(), options))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("native accumulator limit");
+    }
+
+    @Test
     void testCentroidBuildRequiresBucketUnawareTable() {
-        CentroidShardedIvfPqIndexBuildPlanner.validateBucketMode(
-                BucketMode.BUCKET_UNAWARE, "T");
+        CentroidShardedIvfPqIndexBuildPlanner.validateBucketMode(BucketMode.BUCKET_UNAWARE, "T");
 
         assertThatThrownBy(
                         () ->
@@ -191,6 +295,14 @@ public class DefaultGlobalIndexTopoBuilderTest {
                         Collections.singletonList(split), 20);
 
         assertThat(sampledSplits).hasSize(2);
+    }
+
+    @Test
+    void testDistributedTrainingPartitionQuotasUseValidVectorCounts() {
+        assertThat(
+                        DefaultGlobalIndexTopoBuilder.trainingPartitionQuotas(
+                                Arrays.asList(0L, 100L, 300L), 256L))
+                .containsExactly(0L, 100L, 156L);
     }
 
     @Test
@@ -319,6 +431,30 @@ public class DefaultGlobalIndexTopoBuilderTest {
     }
 
     @Test
+    void testLazyTrainingVectorsHonorTaskQuota() {
+        DataField vectorField = new DataField(0, "vec", new VectorType(2, new FloatType()));
+        RowType readType = RowType.of(vectorField, SpecialFields.ROW_ID);
+        CentroidShardedIvfPqIndexBuilder builder =
+                CentroidShardedIvfPqIndexBuilder.forTrainingSamples(
+                        null, readType, vectorField, Collections.singletonList(new Range(0, 10)));
+        CloseableIterator<InternalRow> rows =
+                CloseableIterator.adapterForIterator(
+                        Arrays.<InternalRow>asList(
+                                        GenericRow.of(
+                                                BinaryVector.fromPrimitiveArray(new float[] {1, 2}),
+                                                0L),
+                                        GenericRow.of(
+                                                BinaryVector.fromPrimitiveArray(new float[] {3, 4}),
+                                                1L))
+                                .iterator());
+
+        Iterator<float[]> vectors = builder.trainingVectorsLazy(rows, 1);
+        assertThat(vectors.next()).containsExactly(1.0f, 2.0f);
+        assertThat(vectors.hasNext()).isFalse();
+        assertThat(rows.hasNext()).isTrue();
+    }
+
+    @Test
     void testBroadcastAssignmentBuilderDoesNotSerializeModelPayload() throws Exception {
         DataField vectorField = new DataField(0, "vec", new VectorType(2, new FloatType()));
         CentroidShardedIvfPqIndexBuilder broadcastBuilder =
@@ -393,6 +529,16 @@ public class DefaultGlobalIndexTopoBuilderTest {
         return split.dataSplit().dataFiles().stream()
                 .map(DataFileMeta::fileName)
                 .collect(Collectors.toList());
+    }
+
+    private static Map<String, String> distributedNativeOptions() {
+        Map<String, String> options = new HashMap<>();
+        options.put("index.type", "ivf_pq");
+        options.put("dimension", "4");
+        options.put("nlist", "2");
+        options.put("metric", "l2");
+        options.put("use-opq", "false");
+        return options;
     }
 
     private static BinaryRow partition(int value) {

@@ -37,6 +37,7 @@ import org.apache.paimon.manifest.ManifestEntry;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.partition.PartitionPredicate;
 import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.stats.SimpleStatsEvolutions;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.sink.CommitMessage;
 import org.apache.paimon.table.sink.CommitMessageImpl;
@@ -50,6 +51,7 @@ import org.apache.paimon.utils.InstantiationUtil;
 import org.apache.paimon.utils.MurmurHashUtils;
 import org.apache.paimon.utils.Pair;
 import org.apache.paimon.utils.Range;
+import org.apache.paimon.vector.index.NativeDistributedVectorTraining;
 import org.apache.paimon.vector.index.VectorGlobalModelTrainer;
 import org.apache.paimon.vector.index.VectorGlobalModelTrainers;
 import org.apache.paimon.vector.index.VectorTrainingModel;
@@ -57,10 +59,12 @@ import org.apache.paimon.vector.index.VectorTrainingModel;
 import org.apache.spark.Partitioner;
 import org.apache.spark.TaskContext;
 import org.apache.spark.api.java.JavaPairRDD;
+import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation;
+import org.apache.spark.storage.StorageLevel;
 import org.apache.spark.util.TaskCompletionListener;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -75,6 +79,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.BiFunction;
@@ -90,11 +95,26 @@ import static org.apache.paimon.utils.Preconditions.checkArgument;
 import static org.apache.paimon.vector.index.NativeVectorIndexOptions.CENTROID_ASSIGN_LAZY_STREAMING_OPTION;
 import static org.apache.paimon.vector.index.NativeVectorIndexOptions.CENTROID_BACKEND_NATIVE;
 import static org.apache.paimon.vector.index.NativeVectorIndexOptions.CENTROID_BACKEND_OPTION;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.CENTROID_TRAIN_MODE_DISTRIBUTED;
 import static org.apache.paimon.vector.index.NativeVectorIndexOptions.CENTROID_TRAIN_MODE_LOCAL;
 import static org.apache.paimon.vector.index.NativeVectorIndexOptions.CENTROID_TRAIN_MODE_OPTION;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.DEFAULT_DISTRIBUTED_TRAIN_MAX_PQ_SAMPLE_BYTES;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.DEFAULT_DISTRIBUTED_TRAIN_MIN_PQ_SAMPLE_ROWS;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.DEFAULT_DISTRIBUTED_TRAIN_PQ_SAMPLE_ROWS_PER_CENTROID;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.DISTRIBUTED_TRAIN_MAX_BOOTSTRAP_BYTES_OPTION;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.DISTRIBUTED_TRAIN_MAX_DRIVER_PARTIAL_BYTES_OPTION;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.DISTRIBUTED_TRAIN_MAX_ITERATIONS_OPTION;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.DISTRIBUTED_TRAIN_MAX_PARTIAL_BYTES_OPTION;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.DISTRIBUTED_TRAIN_MAX_PQ_SAMPLE_BYTES_OPTION;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.DISTRIBUTED_TRAIN_MAX_STATE_BYTES_OPTION;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.DISTRIBUTED_TRAIN_PARTITION_BATCH_SIZE_OPTION;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.DISTRIBUTED_TRAIN_TOLERANCE_OPTION;
 import static org.apache.paimon.vector.index.NativeVectorIndexOptions.GLOBAL_INDEX_FILE_EXTENSION;
 import static org.apache.paimon.vector.index.NativeVectorIndexOptions.IVF_PQ_INDEX_TYPE;
 import static org.apache.paimon.vector.index.NativeVectorIndexOptions.IVF_PQ_SHARD_OPTION;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.MAX_DISTRIBUTED_TRAIN_PARTIAL_BYTES;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.MAX_DISTRIBUTED_TRAIN_PQ_SAMPLE_ROWS;
+import static org.apache.paimon.vector.index.NativeVectorIndexOptions.MIN_DISTRIBUTED_TRAIN_PQ_SAMPLE_ROWS;
 import static org.apache.paimon.vector.index.NativeVectorIndexOptions.TRAIN_SAMPLE_ROWS_OPTION;
 import static org.apache.paimon.vector.index.NativeVectorIndexOptions.VECTOR_ROUTING_MODEL_FILE_PREFIX;
 
@@ -265,14 +285,15 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
                 "Option '%s=%s' currently supports only one vector column.",
                 IVF_PQ_SHARD_OPTION,
                 IvfPqShard.CENTROID_BASED.optionValue());
-        checkArgument(
-                CENTROID_TRAIN_MODE_LOCAL.equals(
-                        options.getString(CENTROID_TRAIN_MODE_OPTION, CENTROID_TRAIN_MODE_LOCAL)),
-                "The centroid-sharded implementation of '%s=%s' currently supports only '%s=%s'.",
-                IVF_PQ_SHARD_OPTION,
-                IvfPqShard.CENTROID_BASED.optionValue(),
-                CENTROID_TRAIN_MODE_OPTION,
-                CENTROID_TRAIN_MODE_LOCAL);
+        String trainingMode = centroidTrainingMode(options);
+        String centroidBackend = centroidBackend(options);
+        Map<String, String> nativeOptions =
+                CentroidShardedIvfPqIndexBuilder.nativeOptions(indexType, indexField, options);
+        DistributedTrainingSettings distributedSettings = null;
+        if (CENTROID_TRAIN_MODE_DISTRIBUTED.equals(trainingMode)) {
+            distributedSettings =
+                    distributedTrainingSettings(indexType, indexField, nativeOptions, options);
+        }
 
         Snapshot snapshot = table.snapshotManager().latestSnapshot();
         if (snapshot == null) {
@@ -290,19 +311,30 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
         List<Range> rowRangesToBuild = planner.rowRangesToBuild();
         List<IndexedSplit> splits = planner.splits();
 
-        Map<String, String> nativeOptions =
-                CentroidShardedIvfPqIndexBuilder.nativeOptions(indexType, indexField, options);
         configureExpectedVectorCount(nativeOptions, expectedVectorCount(splits));
-        String centroidBackend = centroidBackend(options);
-        long trainingSampleRows = trainingSampleRows(indexType, indexField, options);
-        List<IndexedSplit> trainingSplits =
-                limitSplitsToTrainingSampleRows(splits, trainingSampleRows);
         VectorTrainingModel trainingModel;
-        try (VectorGlobalModelTrainer trainer =
-                VectorGlobalModelTrainers.create(centroidBackend, indexType, nativeOptions)) {
-            collectTrainingSamplesForCentroidBuild(
-                    table, readType, indexField, trainingSplits, trainer, trainingSampleRows);
-            trainingModel = trainer.finishTraining();
+        if (CENTROID_TRAIN_MODE_DISTRIBUTED.equals(trainingMode)) {
+            trainingModel =
+                    trainDistributedCentroidModel(
+                            spark,
+                            table,
+                            readType,
+                            indexField,
+                            splits,
+                            indexType,
+                            nativeOptions,
+                            options,
+                            distributedSettings);
+        } else {
+            long trainingSampleRows = trainingSampleRows(indexType, indexField, options);
+            List<IndexedSplit> trainingSplits =
+                    limitSplitsToTrainingSampleRows(splits, trainingSampleRows);
+            try (VectorGlobalModelTrainer trainer =
+                    VectorGlobalModelTrainers.create(centroidBackend, indexType, nativeOptions)) {
+                collectTrainingSamplesForCentroidBuild(
+                        table, readType, indexField, trainingSplits, trainer, trainingSampleRows);
+                trainingModel = trainer.finishTraining();
+            }
         }
 
         List<ResultEntry> resultEntries;
@@ -338,6 +370,170 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
                         resultEntries);
         DataIncrement dataIncrement = DataIncrement.indexIncrement(indexFileMetas);
         return Collections.singletonList(centroidCommitMessage(planner.partition(), dataIncrement));
+    }
+
+    private static VectorTrainingModel trainDistributedCentroidModel(
+            SparkSession spark,
+            FileStoreTable table,
+            RowType readType,
+            DataField indexField,
+            List<IndexedSplit> splits,
+            String indexType,
+            Map<String, String> nativeOptions,
+            Options options,
+            DistributedTrainingSettings settings)
+            throws IOException {
+        List<TrainingTask> tasks =
+                trainingTasks(table, indexField, splits, settings.coarseSampleRows);
+        checkArgument(!tasks.isEmpty(), "Distributed vector training requires input files.");
+        List<byte[]> taskList = serializeTasks(tasks);
+
+        JavaSparkContext javaSparkContext = new JavaSparkContext(spark.sparkContext());
+        TrainingTaskContext taskContext = new TrainingTaskContext(table, readType, indexField);
+        JavaRDD<float[]> allVectors =
+                javaSparkContext
+                        .parallelize(taskList, parallelism(taskList.size(), options))
+                        .flatMap(
+                                taskBytes ->
+                                        readTrainingVectorsLazy(
+                                                deserializeTask(taskBytes, "training task"),
+                                                taskContext));
+        JavaRDD<float[]> vectors =
+                limitTrainingVectors(allVectors, settings.coarseSampleRows)
+                        .persist(StorageLevel.DISK_ONLY());
+        try {
+            float[] initialCentroids =
+                    SparkVectorTrainingOrchestrator.deterministicInitialCentroids(
+                            vectors,
+                            settings.dimension,
+                            settings.nlist,
+                            settings.maxBootstrapBytes);
+            NativeCoarseTrainingEngine engine =
+                    new NativeCoarseTrainingEngine(
+                            settings.dimension,
+                            settings.nlist,
+                            settings.maxIterations,
+                            settings.tolerance,
+                            initialCentroids,
+                            settings.maxPartialBytes);
+            SparkVectorTrainingOrchestrator.TrainingResult coarse =
+                    SparkVectorTrainingOrchestrator.trainDistributed(
+                            vectors, engine, settings.orchestratorConfiguration());
+            if (!coarse.converged()) {
+                LOG.warn(
+                        "Distributed IVF-PQ coarse training reached the configured limit of {} "
+                                + "iterations without satisfying the convergence tolerance.",
+                        coarse.iterations());
+            }
+
+            checkArgument(
+                    coarse.vectorCount()
+                                    >= Math.max(
+                                            MIN_DISTRIBUTED_TRAIN_PQ_SAMPLE_ROWS,
+                                            (long) settings.nlist)
+                            && coarse.vectorCount() <= settings.coarseSampleRows,
+                    "Distributed IVF-PQ training requires between max(256, nlist)=%s and %s "
+                            + "sample vectors, but found %s.",
+                    Math.max(MIN_DISTRIBUTED_TRAIN_PQ_SAMPLE_ROWS, (long) settings.nlist),
+                    settings.coarseSampleRows,
+                    coarse.vectorCount());
+            int sampleVectorCount =
+                    (int) Math.min(coarse.vectorCount(), (long) settings.pqSampleRows);
+            float[] rawSample =
+                    collectTrainingSample(vectors, settings.dimension, sampleVectorCount);
+            return NativeDistributedVectorTraining.trainIvfPq(
+                    indexType, nativeOptions, coarse.model(), rawSample, sampleVectorCount);
+        } finally {
+            vectors.unpersist(false);
+        }
+    }
+
+    private static float[] collectTrainingSample(
+            JavaRDD<float[]> vectors, int dimension, int expectedVectorCount) {
+        checkArgument(
+                expectedVectorCount > 0,
+                "Distributed IVF-PQ training requires at least one non-null vector.");
+        int valueCount;
+        try {
+            valueCount = Math.multiplyExact(expectedVectorCount, dimension);
+        } catch (ArithmeticException e) {
+            throw new IllegalArgumentException(
+                    "Distributed PQ sample exceeds the maximum Java array length.", e);
+        }
+        float[] flattened = new float[valueCount];
+        List<float[]> sample = vectors.take(expectedVectorCount);
+        checkArgument(
+                sample.size() == expectedVectorCount,
+                "Distributed training input changed while collecting the PQ sample: "
+                        + "expected %s vectors, but found only %s.",
+                expectedVectorCount,
+                sample.size());
+        for (int i = 0; i < expectedVectorCount; i++) {
+            float[] vector = sample.get(i);
+            checkArgument(
+                    vector != null && vector.length == dimension,
+                    "Distributed PQ sample vector %s has dimension %s, expected %s.",
+                    i,
+                    vector == null ? "null" : vector.length,
+                    dimension);
+            System.arraycopy(vector, 0, flattened, i * dimension, dimension);
+        }
+        return flattened;
+    }
+
+    private static JavaRDD<float[]> limitTrainingVectors(
+            JavaRDD<float[]> vectors, long maxTrainingRows) {
+        checkArgument(maxTrainingRows > 0, "Training row limit must be greater than 0.");
+        int partitionCount = vectors.getNumPartitions();
+        List<Tuple2<Integer, Long>> counts =
+                new ArrayList<>(
+                        vectors.mapPartitionsWithIndex(
+                                        (partitionId, partition) -> {
+                                            long count = 0L;
+                                            while (partition.hasNext()) {
+                                                partition.next();
+                                                count = Math.addExact(count, 1L);
+                                            }
+                                            return Collections.singletonList(
+                                                            new Tuple2<>(partitionId, count))
+                                                    .iterator();
+                                        },
+                                        true)
+                                .collect());
+        counts.sort(Comparator.comparingInt(Tuple2::_1));
+        checkArgument(
+                counts.size() == partitionCount,
+                "Distributed training expected %s partition counts, but found %s.",
+                partitionCount,
+                counts.size());
+
+        List<Long> partitionCounts = new ArrayList<>(partitionCount);
+        for (int partitionId = 0; partitionId < partitionCount; partitionId++) {
+            Tuple2<Integer, Long> count = counts.get(partitionId);
+            checkArgument(
+                    count._1() == partitionId,
+                    "Distributed training is missing the count for partition %s.",
+                    partitionId);
+            partitionCounts.add(count._2());
+        }
+        long[] quotas = trainingPartitionQuotas(partitionCounts, maxTrainingRows);
+
+        return vectors.mapPartitionsWithIndex(
+                (partitionId, partition) -> new BoundedIterator<>(partition, quotas[partitionId]),
+                true);
+    }
+
+    static long[] trainingPartitionQuotas(List<Long> partitionCounts, long maxTrainingRows) {
+        checkArgument(maxTrainingRows > 0, "Training row limit must be greater than 0.");
+        long[] quotas = new long[partitionCounts.size()];
+        long remaining = maxTrainingRows;
+        for (int partitionId = 0; partitionId < partitionCounts.size(); partitionId++) {
+            long count = partitionCounts.get(partitionId);
+            checkArgument(count >= 0, "Training partition count must not be negative.");
+            quotas[partitionId] = Math.min(remaining, count);
+            remaining -= quotas[partitionId];
+        }
+        return quotas;
     }
 
     static CommitMessage centroidCommitMessage(BinaryRow partition, DataIncrement dataIncrement) {
@@ -404,19 +600,9 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
             return splits;
         }
 
-        List<TrainingFile> candidates = new ArrayList<>();
-        for (IndexedSplit split : splits) {
-            for (DataFileMeta file : split.dataSplit().dataFiles()) {
-                candidates.add(new TrainingFile(split, file));
-            }
-        }
-        candidates.sort(
-                Comparator.comparingLong(TrainingFile::samplingKey)
-                        .thenComparing(candidate -> candidate.file.fileName()));
-
         List<IndexedSplit> result = new ArrayList<>();
         long selectedRows = 0;
-        for (TrainingFile candidate : candidates) {
+        for (TrainingFile candidate : sortedTrainingFiles(splits)) {
             result.add(
                     copySplitWithDataFiles(
                             candidate.split, Collections.singletonList(candidate.file)));
@@ -426,6 +612,297 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
             }
         }
         return result;
+    }
+
+    private static List<TrainingTask> trainingTasks(
+            FileStoreTable table,
+            DataField indexField,
+            List<IndexedSplit> splits,
+            long maxTrainingRows) {
+        checkArgument(maxTrainingRows > 0, "Training row limit must be greater than 0.");
+        int fieldIndex = table.schema().logicalRowType().getFieldIndex(indexField.name());
+        SimpleStatsEvolutions evolutions =
+                new SimpleStatsEvolutions(
+                        schemaId -> table.schemaManager().schema(schemaId).fields(),
+                        table.schema().id());
+        List<TrainingTask> result = new ArrayList<>();
+        long remainingEstimatedRows = maxTrainingRows;
+        boolean unknownValidCount = false;
+        for (TrainingFile candidate : sortedTrainingFiles(splits)) {
+            if (remainingEstimatedRows == 0) {
+                break;
+            }
+            IndexedSplit selected =
+                    copySplitWithDataFiles(
+                            candidate.split, Collections.singletonList(candidate.file));
+            long taskLimit;
+            if (unknownValidCount) {
+                taskLimit = maxTrainingRows;
+            } else {
+                Long nullCount = selected.dataSplit().nullCount(fieldIndex, evolutions);
+                if (nullCount == null) {
+                    unknownValidCount = true;
+                    taskLimit = maxTrainingRows;
+                } else {
+                    long validRows = Math.max(0L, candidate.file.rowCount() - nullCount);
+                    taskLimit = Math.min(remainingEstimatedRows, validRows);
+                    remainingEstimatedRows -= taskLimit;
+                }
+            }
+            if (taskLimit == 0) {
+                continue;
+            }
+            result.add(new TrainingTask(selected, taskLimit));
+        }
+        return result;
+    }
+
+    private static List<TrainingFile> sortedTrainingFiles(List<IndexedSplit> splits) {
+        List<TrainingFile> candidates = new ArrayList<>();
+        for (IndexedSplit split : splits) {
+            for (DataFileMeta file : split.dataSplit().dataFiles()) {
+                candidates.add(new TrainingFile(split, file));
+            }
+        }
+        candidates.sort(
+                Comparator.comparingLong(TrainingFile::samplingKey)
+                        .thenComparing(candidate -> candidate.file.fileName()));
+        return candidates;
+    }
+
+    private static Iterator<float[]> readTrainingVectorsLazy(
+            TrainingTask task, TrainingTaskContext context) throws Exception {
+        IndexedSplit split = task.split;
+        CentroidShardedIvfPqIndexBuilder indexBuilder = context.newBuilder(split.rowRanges());
+        ReadBuilder readBuilder = indexBuilder.table().newReadBuilder();
+        readBuilder.withReadType(indexBuilder.readType());
+
+        RecordReader<InternalRow> recordReader = null;
+        CloseableIterator<InternalRow> rows = null;
+        try {
+            recordReader = readBuilder.newRead().createReader(split);
+            rows = recordReader.toCloseableIterator();
+            ClosingIterator<float[]> iterator =
+                    new ClosingIterator<>(
+                            indexBuilder.trainingVectorsLazy(rows, task.maxVectors),
+                            rows,
+                            recordReader,
+                            indexBuilder);
+            registerTaskCompletionClose(iterator);
+            return iterator;
+        } catch (Throwable t) {
+            closeQuietly(rows, t);
+            closeQuietly(recordReader, t);
+            closeQuietly(indexBuilder, t);
+            throw t;
+        }
+    }
+
+    static String centroidTrainingMode(Options options) {
+        String mode =
+                options.getString(CENTROID_TRAIN_MODE_OPTION, CENTROID_TRAIN_MODE_LOCAL)
+                        .trim()
+                        .toLowerCase(Locale.ROOT);
+        checkArgument(
+                CENTROID_TRAIN_MODE_LOCAL.equals(mode)
+                        || CENTROID_TRAIN_MODE_DISTRIBUTED.equals(mode),
+                "Option '%s' supports only '%s' or '%s', but was '%s'.",
+                CENTROID_TRAIN_MODE_OPTION,
+                CENTROID_TRAIN_MODE_LOCAL,
+                CENTROID_TRAIN_MODE_DISTRIBUTED,
+                mode);
+        return mode;
+    }
+
+    static DistributedTrainingSettings distributedTrainingSettings(
+            String indexType,
+            DataField indexField,
+            Map<String, String> nativeOptions,
+            Options options) {
+        checkArgument(
+                IVF_PQ_INDEX_TYPE.equals(indexType),
+                "Distributed vector training supports only index type '%s'.",
+                IVF_PQ_INDEX_TYPE);
+        int dimension = parsePositiveNativeInt(nativeOptions, "dimension");
+        int nlist = parsePositiveNativeInt(nativeOptions, "nlist");
+        checkArgument(
+                "l2".equals(normalizeNativeOption(nativeOptions.get("metric"))),
+                "Distributed vector training requires option 'metric=l2'.");
+        String useOpq = nativeOptions.get("use-opq");
+        checkArgument(
+                useOpq == null || "false".equals(normalizeNativeOption(useOpq)),
+                "Distributed vector training requires option 'use-opq=false'.");
+        nativeOptions.put("metric", "l2");
+        nativeOptions.put("use-opq", "false");
+
+        int maxIterations =
+                positiveIntOption(
+                        options,
+                        DISTRIBUTED_TRAIN_MAX_ITERATIONS_OPTION,
+                        SparkVectorTrainingOrchestrator.DEFAULT_MAX_ITERATIONS);
+        checkArgument(
+                maxIterations <= SparkVectorTrainingOrchestrator.MAX_ITERATIONS_LIMIT,
+                "Option '%s' must not exceed %s.",
+                DISTRIBUTED_TRAIN_MAX_ITERATIONS_OPTION,
+                SparkVectorTrainingOrchestrator.MAX_ITERATIONS_LIMIT);
+        double tolerance =
+                nonNegativeDoubleOption(options, DISTRIBUTED_TRAIN_TOLERANCE_OPTION, 1.0e-4d);
+        int maxStateBytes =
+                positiveIntOption(
+                        options,
+                        DISTRIBUTED_TRAIN_MAX_STATE_BYTES_OPTION,
+                        SparkVectorTrainingOrchestrator.DEFAULT_MAX_STATE_BYTES);
+        int maxPartialBytes =
+                positiveIntOption(
+                        options,
+                        DISTRIBUTED_TRAIN_MAX_PARTIAL_BYTES_OPTION,
+                        SparkVectorTrainingOrchestrator.DEFAULT_MAX_PARTIAL_BYTES);
+        checkArgument(
+                maxPartialBytes <= MAX_DISTRIBUTED_TRAIN_PARTIAL_BYTES,
+                "Option '%s' must not exceed the native accumulator limit of %s bytes.",
+                DISTRIBUTED_TRAIN_MAX_PARTIAL_BYTES_OPTION,
+                MAX_DISTRIBUTED_TRAIN_PARTIAL_BYTES);
+        long maxDriverPartialBytes =
+                positiveLongOption(
+                        options,
+                        DISTRIBUTED_TRAIN_MAX_DRIVER_PARTIAL_BYTES_OPTION,
+                        SparkVectorTrainingOrchestrator.DEFAULT_MAX_DRIVER_PARTIAL_BYTES);
+        checkArgument(
+                maxDriverPartialBytes >= maxPartialBytes,
+                "Option '%s' must be at least option '%s'.",
+                DISTRIBUTED_TRAIN_MAX_DRIVER_PARTIAL_BYTES_OPTION,
+                DISTRIBUTED_TRAIN_MAX_PARTIAL_BYTES_OPTION);
+        int partitionBatchSize =
+                positiveIntOption(
+                        options,
+                        DISTRIBUTED_TRAIN_PARTITION_BATCH_SIZE_OPTION,
+                        SparkVectorTrainingOrchestrator.DEFAULT_PARTITION_BATCH_SIZE);
+        checkArgument(
+                partitionBatchSize <= SparkVectorTrainingOrchestrator.MAX_PARTITION_BATCH_SIZE,
+                "Option '%s' must not exceed %s.",
+                DISTRIBUTED_TRAIN_PARTITION_BATCH_SIZE_OPTION,
+                SparkVectorTrainingOrchestrator.MAX_PARTITION_BATCH_SIZE);
+        long maxBootstrapBytes =
+                positiveLongOption(
+                        options,
+                        DISTRIBUTED_TRAIN_MAX_BOOTSTRAP_BYTES_OPTION,
+                        SparkVectorTrainingOrchestrator.DEFAULT_MAX_BOOTSTRAP_BYTES);
+
+        long requestedSampleRows = trainingSampleRows(indexType, indexField, options);
+        if (requestedSampleRows < 0) {
+            requestedSampleRows =
+                    Math.max(
+                            DEFAULT_DISTRIBUTED_TRAIN_MIN_PQ_SAMPLE_ROWS,
+                            (long) nlist * DEFAULT_DISTRIBUTED_TRAIN_PQ_SAMPLE_ROWS_PER_CENTROID);
+        }
+        checkArgument(
+                requestedSampleRows >= MIN_DISTRIBUTED_TRAIN_PQ_SAMPLE_ROWS,
+                "Distributed IVF-PQ option '%s' must be at least %s rows.",
+                TRAIN_SAMPLE_ROWS_OPTION,
+                MIN_DISTRIBUTED_TRAIN_PQ_SAMPLE_ROWS);
+        checkArgument(
+                requestedSampleRows >= nlist,
+                "Distributed IVF-PQ option '%s' must be at least nlist=%s rows.",
+                TRAIN_SAMPLE_ROWS_OPTION,
+                nlist);
+        long maxPqSampleBytes =
+                positiveLongOption(
+                        options,
+                        DISTRIBUTED_TRAIN_MAX_PQ_SAMPLE_BYTES_OPTION,
+                        DEFAULT_DISTRIBUTED_TRAIN_MAX_PQ_SAMPLE_BYTES);
+        long bytesPerVector = Math.multiplyExact((long) dimension, Float.BYTES);
+        long rowsAllowedByBytes = maxPqSampleBytes / bytesPerVector;
+        long pqSampleRows =
+                Math.min(
+                        requestedSampleRows,
+                        Math.min(
+                                MAX_DISTRIBUTED_TRAIN_PQ_SAMPLE_ROWS,
+                                Math.min(
+                                        rowsAllowedByBytes, (long) Integer.MAX_VALUE / dimension)));
+        checkArgument(
+                pqSampleRows >= Math.max(MIN_DISTRIBUTED_TRAIN_PQ_SAMPLE_ROWS, (long) nlist),
+                "Option '%s' allows only %s vectors of dimension %s, but distributed IVF-PQ "
+                        + "requires room for at least max(256, nlist)=%s vectors.",
+                DISTRIBUTED_TRAIN_MAX_PQ_SAMPLE_BYTES_OPTION,
+                pqSampleRows,
+                dimension,
+                Math.max(MIN_DISTRIBUTED_TRAIN_PQ_SAMPLE_ROWS, (long) nlist));
+
+        return new DistributedTrainingSettings(
+                dimension,
+                nlist,
+                maxIterations,
+                tolerance,
+                maxStateBytes,
+                maxPartialBytes,
+                maxDriverPartialBytes,
+                partitionBatchSize,
+                maxBootstrapBytes,
+                requestedSampleRows,
+                (int) pqSampleRows);
+    }
+
+    private static int parsePositiveNativeInt(Map<String, String> nativeOptions, String key) {
+        String value = nativeOptions.get(key);
+        checkArgument(
+                value != null && !"auto".equalsIgnoreCase(value.trim()),
+                "Distributed vector training requires a fixed positive option '%s'.",
+                key);
+        try {
+            int parsed = Integer.parseInt(value.trim());
+            checkArgument(
+                    parsed > 0,
+                    "Distributed vector training requires a fixed positive option '%s'.",
+                    key);
+            return parsed;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(
+                    "Distributed vector training requires a fixed positive option '"
+                            + key
+                            + "', but was '"
+                            + value
+                            + "'.",
+                    e);
+        }
+    }
+
+    private static String normalizeNativeOption(@Nullable String value) {
+        return value == null ? null : value.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private static int positiveIntOption(Options options, String key, int defaultValue) {
+        long value = positiveLongOption(options, key, defaultValue);
+        checkArgument(value <= Integer.MAX_VALUE, "Option '%s' exceeds the integer limit.", key);
+        return (int) value;
+    }
+
+    private static long positiveLongOption(Options options, String key, long defaultValue) {
+        String raw = options.getString(key, Long.toString(defaultValue));
+        try {
+            long value = Long.parseLong(raw.trim());
+            checkArgument(value > 0, "Option '%s' must be greater than 0.", key);
+            return value;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(
+                    "Invalid value for '" + key + "': " + raw + ". Must be a positive long.", e);
+        }
+    }
+
+    private static double nonNegativeDoubleOption(
+            Options options, String key, double defaultValue) {
+        String raw = options.getString(key, Double.toString(defaultValue));
+        try {
+            double value = Double.parseDouble(raw.trim());
+            checkArgument(
+                    !Double.isNaN(value) && !Double.isInfinite(value) && value >= 0.0d,
+                    "Option '%s' must be finite and non-negative.",
+                    key);
+            return value;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(
+                    "Invalid value for '" + key + "': " + raw + ". Must be a non-negative double.",
+                    e);
+        }
     }
 
     static long expectedVectorCount(List<IndexedSplit> splits) {
@@ -450,16 +927,37 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
     private static IndexedSplit copySplitWithDataFiles(
             IndexedSplit split, List<DataFileMeta> dataFiles) {
         DataSplit dataSplit = split.dataSplit();
-        DataSplit sampledDataSplit =
+        DataSplit.Builder builder =
                 DataSplit.builder()
-                        .withPartition(dataSplit.partition())
+                        .withSnapshot(dataSplit.snapshotId())
+                        .withPartition(dataSplit.partition().copy())
                         .withBucket(dataSplit.bucket())
                         .withTotalBuckets(dataSplit.totalBuckets())
                         .withDataFiles(dataFiles)
                         .withBucketPath(dataSplit.bucketPath())
-                        .rawConvertible(dataSplit.rawConvertible())
-                        .build();
+                        .isStreaming(dataSplit.isStreaming())
+                        .rawConvertible(dataSplit.rawConvertible());
+        dataSplit.deletionFiles().ifPresent(builder::withDataDeletionFiles);
+        DataSplit sampledDataSplit = builder.build();
         return new IndexedSplit(sampledDataSplit, split.rowRanges(), split.scores());
+    }
+
+    private static <T extends java.io.Serializable> List<byte[]> serializeTasks(List<T> tasks)
+            throws IOException {
+        List<byte[]> serialized = new ArrayList<>(tasks.size());
+        for (T task : tasks) {
+            serialized.add(InstantiationUtil.serializeObject(task));
+        }
+        return serialized;
+    }
+
+    private static <T> T deserializeTask(byte[] bytes, String description) throws IOException {
+        try {
+            return InstantiationUtil.deserializeObject(
+                    bytes, DefaultGlobalIndexTopoBuilder.class.getClassLoader());
+        } catch (ClassNotFoundException e) {
+            throw new IOException("Failed to deserialize " + description + '.', e);
+        }
     }
 
     private static long saturatedAdd(long left, long right) {
@@ -485,10 +983,7 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
         JavaSparkContext javaSparkContext = new JavaSparkContext(spark.sparkContext());
         byte[] trainingModelPayload = serializeTrainingModelPayload(trainingModel);
         int nlist = trainingModel.centroids().nlist();
-        List<IndexedSplit> taskList = new ArrayList<>();
-        for (IndexedSplit split : splits) {
-            taskList.add(split);
-        }
+        List<byte[]> taskList = serializeTasks(splits);
         if (taskList.isEmpty()) {
             return Collections.emptyList();
         }
@@ -511,13 +1006,19 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
                             ? javaSparkContext
                                     .parallelize(taskList, scanParallelism)
                                     .flatMapToPair(
-                                            task ->
+                                            taskBytes ->
                                                     assignCentroidVectorsLazyStreaming(
-                                                            task, assignmentContext))
+                                                            deserializeTask(
+                                                                    taskBytes, "centroid split"),
+                                                            assignmentContext))
                             : javaSparkContext
                                     .parallelize(taskList, scanParallelism)
                                     .flatMapToPair(
-                                            task -> assignCentroidVectors(task, assignmentContext));
+                                            taskBytes ->
+                                                    assignCentroidVectors(
+                                                            deserializeTask(
+                                                                    taskBytes, "centroid split"),
+                                                            assignmentContext));
 
             CentroidShardedIvfPqIndexBuilder shardBuilder =
                     CentroidShardedIvfPqIndexBuilder.forShardBuild(
@@ -911,6 +1412,31 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
         }
     }
 
+    private static class BoundedIterator<T> implements Iterator<T> {
+
+        private final Iterator<T> delegate;
+        private long remaining;
+
+        private BoundedIterator(Iterator<T> delegate, long limit) {
+            this.delegate = delegate;
+            this.remaining = limit;
+        }
+
+        @Override
+        public boolean hasNext() {
+            return remaining > 0 && delegate.hasNext();
+        }
+
+        @Override
+        public T next() {
+            if (!hasNext()) {
+                throw new java.util.NoSuchElementException();
+            }
+            remaining--;
+            return delegate.next();
+        }
+    }
+
     private static void registerTaskCompletionClose(ClosingIterator<?> iterator) {
         TaskContext taskContext = TaskContext.get();
         if (taskContext != null) {
@@ -960,6 +1486,104 @@ public class DefaultGlobalIndexTopoBuilder implements GlobalIndexTopologyBuilder
                             nativeOptions);
             builder.setBroadcastTrainingModelPayload(trainingModelBroadcast.value());
             return builder;
+        }
+    }
+
+    private static class TrainingTaskContext implements java.io.Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private final FileStoreTable table;
+        private final RowType readType;
+        private final DataField indexField;
+
+        private TrainingTaskContext(FileStoreTable table, RowType readType, DataField indexField) {
+            this.table = table;
+            this.readType = readType;
+            this.indexField = indexField;
+        }
+
+        private CentroidShardedIvfPqIndexBuilder newBuilder(List<Range> rowRanges) {
+            return CentroidShardedIvfPqIndexBuilder.forTrainingSamples(
+                    table, readType, indexField, rowRanges);
+        }
+    }
+
+    static class TrainingTask implements java.io.Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private final IndexedSplit split;
+        private final long maxVectors;
+
+        private TrainingTask(IndexedSplit split, long maxVectors) {
+            this.split = split;
+            this.maxVectors = maxVectors;
+        }
+
+        IndexedSplit split() {
+            return split;
+        }
+
+        long maxVectors() {
+            return maxVectors;
+        }
+    }
+
+    static class DistributedTrainingSettings {
+
+        private final int dimension;
+        private final int nlist;
+        private final int maxIterations;
+        private final double tolerance;
+        private final int maxStateBytes;
+        private final int maxPartialBytes;
+        private final long maxDriverPartialBytes;
+        private final int partitionBatchSize;
+        private final long maxBootstrapBytes;
+        private final long coarseSampleRows;
+        private final int pqSampleRows;
+
+        private DistributedTrainingSettings(
+                int dimension,
+                int nlist,
+                int maxIterations,
+                double tolerance,
+                int maxStateBytes,
+                int maxPartialBytes,
+                long maxDriverPartialBytes,
+                int partitionBatchSize,
+                long maxBootstrapBytes,
+                long coarseSampleRows,
+                int pqSampleRows) {
+            this.dimension = dimension;
+            this.nlist = nlist;
+            this.maxIterations = maxIterations;
+            this.tolerance = tolerance;
+            this.maxStateBytes = maxStateBytes;
+            this.maxPartialBytes = maxPartialBytes;
+            this.maxDriverPartialBytes = maxDriverPartialBytes;
+            this.partitionBatchSize = partitionBatchSize;
+            this.maxBootstrapBytes = maxBootstrapBytes;
+            this.coarseSampleRows = coarseSampleRows;
+            this.pqSampleRows = pqSampleRows;
+        }
+
+        private SparkVectorTrainingOrchestrator.Configuration orchestratorConfiguration() {
+            return new SparkVectorTrainingOrchestrator.Configuration(
+                    maxIterations,
+                    maxStateBytes,
+                    maxPartialBytes,
+                    maxDriverPartialBytes,
+                    partitionBatchSize);
+        }
+
+        int pqSampleRows() {
+            return pqSampleRows;
+        }
+
+        long coarseSampleRows() {
+            return coarseSampleRows;
         }
     }
 

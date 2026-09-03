@@ -276,7 +276,7 @@ class CentroidShardedIvfPqIndexBuildPlanner {
         List<IndexedSplit> result = new ArrayList<>();
         for (Map.Entry<BinaryRow, Map<Integer, List<ManifestEntry>>> partitionEntry :
                 entriesByPartitionAndBucket.entrySet()) {
-            BinaryRow partition = partitionEntry.getKey();
+            BinaryRow partition = partitionEntry.getKey().copy();
             for (Map.Entry<Integer, List<ManifestEntry>> bucketEntry :
                     partitionEntry.getValue().entrySet()) {
                 List<ManifestEntry> bucketEntries = bucketEntry.getValue();

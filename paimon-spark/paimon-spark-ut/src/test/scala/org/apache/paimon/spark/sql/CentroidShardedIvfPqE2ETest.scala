@@ -39,6 +39,13 @@ class CentroidShardedIvfPqE2ETest extends PaimonSparkTestBase {
   private val ScaleRowsProperty = "paimon.centroid.ivfpq.scale.rows"
   private val ScaleDimensionProperty = "paimon.centroid.ivfpq.scale.dimension"
 
+  override protected def sparkConf =
+    super.sparkConf.set(
+      "spark.serializer",
+      sys.props.getOrElse(
+        "paimon.centroid.ivfpq.spark.serializer",
+        "org.apache.spark.serializer.KryoSerializer"))
+
   test("centroid IVF-PQ build manifest prune and query end to end") {
     assumeCentroidNativeAvailable()
 
@@ -171,6 +178,79 @@ class CentroidShardedIvfPqE2ETest extends PaimonSparkTestBase {
     }
   }
 
+  test("distributed coarse training builds a queryable centroid IVF-PQ index") {
+    assumeCentroidNativeAvailable()
+
+    withTable("T") {
+      val dimension = 4
+      val nlist = 2
+      val first =
+        (0 until 160).map(id => TestPoint(id, clusteredVector(id % nlist, id / nlist, dimension)))
+      val second =
+        (160 until 320).map(id => TestPoint(id, clusteredVector(id % nlist, id / nlist, dimension)))
+      val points = first ++ second
+
+      createTable(dimension)
+      appendPoints(first)
+      appendPoints(second)
+      assert(loadTable("T").store().newScan().plan().files().size() > 1)
+
+      val result = spark
+        .sql(
+          createIndexSql(nlist, pqM = 2, trainSampleRows = points.size, trainMode = "distributed"))
+        .collect()
+        .head
+      assert(result.getBoolean(0))
+
+      val entries = loadTable("T").store().newIndexFileHandler().scan(IndexType).asScala.toSeq
+      val routingEntries = entries.filter(_.indexFile().fileKind() == IndexFileKind.ROUTING_MODEL)
+      val dataEntries = entries.filter(_.indexFile().fileKind() == IndexFileKind.DATA)
+      assert(routingEntries.size == 1)
+      assert(dataEntries.size > 1)
+      assert(dataEntries.map(_.indexFile().rowCount()).sum == points.size.toLong)
+      val modelDigest =
+        VectorIndexMeta
+          .deserialize(routingEntries.head.indexFile().globalIndexMeta().indexMeta())
+          .modelDigest()
+      assert(
+        dataEntries.forall(
+          entry =>
+            VectorIndexMeta
+              .deserialize(entry.indexFile().globalIndexMeta().indexMeta())
+              .modelDigest() ==
+              modelDigest))
+
+      val target = points(17)
+      val table = loadTable("T")
+      val builder = new SparkVectorSearchBuilderImpl(table)
+      builder
+        .withVectorColumn("embedding")
+        .withVector(target.vector)
+        .withLimit(5)
+        .withOption("ivf.nprobe", "1")
+        .withOption("refine_factor", "8")
+      val plan = builder.newVectorScan().scan()
+      assert(!plan.splits().asScala.exists(_.isInstanceOf[RawVectorSearchSplit]))
+      val routedFiles = plan
+        .splits()
+        .asScala
+        .collect { case split: IndexVectorSearchSplit => split }
+        .flatMap(_.vectorIndexFiles().asScala)
+      assert(routedFiles.size == 1)
+      assert(!builder.newVectorRead().read(plan).results().isEmpty)
+
+      val rows = spark
+        .sql(s"""
+                |SELECT id FROM vector_search(
+                |  'T', 'embedding', ${vectorSql(target.vector)}, 5,
+                |  map('ivf.nprobe', '1', 'refine_factor', '8'))
+                |WHERE pt = 'p0'
+                |""".stripMargin)
+        .collect()
+      assert(rows.exists(_.getInt(0) == target.id))
+    }
+  }
+
   test("100k centroid IVF-PQ build and query scale check") {
     assume(
       java.lang.Boolean.getBoolean(ScaleEnabledProperty),
@@ -266,7 +346,11 @@ class CentroidShardedIvfPqE2ETest extends PaimonSparkTestBase {
                  |""".stripMargin)
   }
 
-  private def createIndexSql(nlist: Int, pqM: Int, trainSampleRows: Int): String = {
+  private def createIndexSql(
+      nlist: Int,
+      pqM: Int,
+      trainSampleRows: Int,
+      trainMode: String = "local"): String = {
     s"""
        |CALL sys.create_global_index(
        |  table => 'test.T',
@@ -274,7 +358,7 @@ class CentroidShardedIvfPqE2ETest extends PaimonSparkTestBase {
        |  index_column => 'embedding',
        |  index_type => '$IndexType',
        |  options => 'ivf.pq.shard=centroid-based,
-       |              ivf.pq.train.mode=local,
+       |              ivf.pq.train.mode=$trainMode,
        |              ivf.pq.centroid.backend=native,
        |              ivf-pq.nlist=$nlist,
        |              ivf-pq.pq.m=$pqM,
@@ -354,12 +438,18 @@ class CentroidShardedIvfPqE2ETest extends PaimonSparkTestBase {
 
   private def assumeCentroidNativeAvailable(): Unit = {
     val result = centroidNativeAvailability()
-    assume(
-      result.isEmpty,
-      "Centroid IVF-PQ E2E requires a paimon-vector-index Java/native build with " +
-        "training-model serde, centroid routing, centroid shard writing and forced-centroid search APIs. " +
-        result.getOrElse("")
-    )
+    result.foreach {
+      error =>
+        if (System.getProperty("paimon.vindex.native.path") != null) {
+          fail(s"Configured centroid IVF-PQ native library is unusable: $error")
+        }
+        assume(
+          condition = false,
+          "Centroid IVF-PQ E2E requires a paimon-vector-index Java/native build with " +
+            "training-model serde, centroid routing, centroid shard writing and " +
+            s"forced-centroid search APIs. $error"
+        )
+    }
   }
 
   private def centroidNativeAvailability(): Option[String] = {
